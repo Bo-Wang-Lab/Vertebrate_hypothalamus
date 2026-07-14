@@ -1,0 +1,159 @@
+---
+title: "SoupX"
+output: html_document
+date: "2024-08-19"
+---
+
+```{r}
+library(SoupX)
+library(readr)
+library(Matrix)
+library(tidyverse)
+library(Seurat)
+source.folder<-"Hicat_CT_Analysis/source_folder/"
+```
+
+```{r}
+source(paste0(source.folder,"hicat.R"))
+source(paste0(source.folder,"IO.R"))
+```
+
+
+```{r}
+Run_name = "WL"
+MO_unfiltered <- ReadMtx( mtx= paste("Wholebrain_Kilifish_Dat/WL/raw_feature_bc_matrix/matrix.mtx.gz",sep=""),
+cells = paste("Wholebrain_Kilifish_Dat/WL/raw_feature_bc_matrix/barcodes.tsv.gz",sep=""),
+features = paste("Wholebrain_Kilifish_Dat/WL/raw_feature_bc_matrix/features.tsv.gz",sep=""),
+                 feature.column=1, mtx.transpose=F)
+```
+
+```{r}
+MO_filtered <- read.csv(file = paste('SoupX/Killi/processed_WL_Kilifish_01252026.h5ad_filtered.csv',sep=""),row.names=1)
+MO_filtered_matrix = as.matrix(MO_filtered)
+MO_filtered_CSC <- as((MO_filtered_matrix), "dgCMatrix")
+```
+
+```{r}
+MO_unfiltered_gene = MO_unfiltered[rownames(MO_unfiltered) %in%(rownames(MO_filtered_CSC)),]
+```
+
+```{r}
+MO_sc1 = SoupChannel(MO_unfiltered_gene,MO_filtered_CSC)
+```
+
+```{r}
+MO_clusters <- read.csv(file = paste('SoupX/Killi/processed_WL_Kilifish_01252026.h5ad_leiden_clusters.csv',sep =""),row.names=1)
+```
+
+```{r}
+MO_sc1_clus = setClusters(MO_sc1, setNames(MO_clusters$leiden_clusters, rownames(MO_clusters)))
+```
+
+```{r}
+MO_sc1_clus <- autoEstCont(MO_sc1_clus, soupQuantile = .2)
+```
+```{r}
+MO_sc1_clus = setContaminationFraction(MO_sc1_clus, 0.025)
+```
+
+```{r}
+MO_out1 = adjustCounts(MO_sc1_clus,roundToInt = T)
+```
+
+```{r}
+# Code from alleninstititute scratch.io 
+write_dgCMatrix_csv <- function(mat,
+                                filename,
+                                col1_name = "gene",
+                                chunk_size = 1000) {
+
+  #library(Matrix)
+  #library(data.table)
+
+  # Transpose so retrieval of "rows" is much faster
+  mat <- Matrix::t(mat)
+
+  # Row names
+  row_names <- colnames(mat)
+
+  # gene names are now columns
+  col_names <- rownames(mat)
+
+  n_row <- length(row_names)
+  n_col <- length(col_names)
+
+  n_chunks <- floor(n_row/chunk_size)
+
+  # Initial chunk
+  chunk <- 1
+  chunk_start <- 1 + chunk_size * (chunk - 1)
+  chunk_end <- chunk_size * chunk
+  print(paste0("Writing rows ",chunk_start," to ", chunk_end))
+  chunk_mat <- t(as.matrix(mat[,chunk_start:chunk_end]))
+  chunk_df <- cbind(data.frame(col1 = row_names[chunk_start:chunk_end]),as.data.frame(chunk_mat))
+  names(chunk_df)[1] <- col1_name
+  data.table::fwrite(chunk_df, file = filename, append = F)
+
+  # chunkation over chunks
+  for(chunk in 2:n_chunks) {
+    chunk_start <- 1 + chunk_size * (chunk - 1)
+    chunk_end <- chunk_size * chunk
+    print(paste0("Writing rows ",chunk_start," to ", chunk_end))
+    chunk_mat <- t(as.matrix(mat[,chunk_start:chunk_end]))
+    chunk_df <- cbind(data.frame(col1 = row_names[chunk_start:chunk_end]),as.data.frame(chunk_mat))
+    data.table::fwrite(chunk_df, file = filename, append = T)
+  }
+
+  # Remaining samples
+  chunk_start <- (n_chunks*chunk_size + 1)
+  chunk_end <- n_row
+  print(paste0("Writing rows ",chunk_start," to ", chunk_end))
+  chunk_mat <- t(as.matrix(mat[,chunk_start:chunk_end]))
+  chunk_df <- cbind(data.frame(col1 = row_names[chunk_start:chunk_end]),as.data.frame(chunk_mat))
+  data.table::fwrite(chunk_df, file = filename, append = T)
+
+}
+
+```
+
+```{r}
+write_dgCMatrix_csv(MO_out1,filename = paste("SoupX/Killi/", "processedrun_WL_killi_soupcorr.csv",sep = ""))
+```
+
+```{r}
+MO_outsparse = as(MO_out1, "sparseMatrix") 
+scdata.MO <- CreateSeuratObject(counts = MO_outsparse, assay = "RNA", meta.data = MO_sc1_clus$metaData, project = "Prairie Vole")
+scdata.MO <- DietSeurat(scdata.MO)
+scdata.MO <- SCTransform(scdata.MO, vst.flavor = "v2", verbose = FALSE) %>%
+  RunPCA(npcs = 30, verbose = FALSE) %>%
+  RunUMAP(reduction = "pca", dims = 1:30, verbose = FALSE) %>%
+  RunTSNE(reduction = "pca", dims = 1:30, check_duplicates=FALSE, verbose = FALSE) %>%
+  FindNeighbors(reduction = "pca", dims = 1:30, verbose = FALSE)
+```
+
+```{r}
+de.param <- de_param(padj.th     = 0.05,
+                     lfc.th      = 1,
+                     low.th      = 1,
+                     q1.th       = 0.4,
+                     q2.th       = NULL,
+                     q.diff.th   = 0.5,
+                     de.score.th = 150,
+                     min.cells = 10)
+MO.clust <- iter_clust_hicat(scdata.MO, de.param, "tsne")
+```
+```{r}
+#SC object with hicat clusters
+scdata.MO.hicat<-MO.clust[[1]]
+
+#List containting each cells hicat cluster with DE genes
+clust.result <- MO.clust[[2]]
+length(unique(clust.result$cl)) #equivalently length(unique(scdata.MO.hicat@meta.data$hicat_merged))
+
+#plottable
+plt1 <-MO.clust[[3]]
+write_rds(plt1,file="plt1.c.rds")
+plt1<-read_rds(file="plt1.c.rds")
+#"plot" in console to plot
+```
+
