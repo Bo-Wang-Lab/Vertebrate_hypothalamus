@@ -10,25 +10,21 @@ library(readr)
 library(Matrix)
 library(tidyverse)
 library(Seurat)
-source.folder<-"Hicat_CT_Analysis/source_folder/"
-```
-
-```{r}
-source(paste0(source.folder,"hicat.R"))
-source(paste0(source.folder,"IO.R"))
 ```
 
 
 ```{r}
-Run_name = "WL"
-MO_unfiltered <- ReadMtx( mtx= paste("Wholebrain_Kilifish_Dat/WL/raw_feature_bc_matrix/matrix.mtx.gz",sep=""),
-cells = paste("Wholebrain_Kilifish_Dat/WL/raw_feature_bc_matrix/barcodes.tsv.gz",sep=""),
-features = paste("Wholebrain_Kilifish_Dat/WL/raw_feature_bc_matrix/features.tsv.gz",sep=""),
+#Input raw STARSolo output
+Run_name = "DR"
+MO_unfiltered <- ReadMtx( mtx= paste("../../SoupX/DR/DanioRerio1/Gene/raw/matrix.mtx.gz",sep=""),
+cells = paste("../../SoupX/DR/DanioRerio1/Gene/raw/barcodes.tsv.gz",sep=""),
+features = paste("../../SoupX/DR/DanioRerio1/Gene/raw/features.tsv.gz",sep=""),
                  feature.column=1, mtx.transpose=F)
 ```
 
 ```{r}
-MO_filtered <- read.csv(file = paste('SoupX/Killi/processed_WL_Kilifish_01252026.h5ad_filtered.csv',sep=""),row.names=1)
+#Input filtered counts
+MO_filtered <- read.csv(file = paste('../../SoupX/DR/preprocessed_DanioRerio1.h5ad_filtered.csv',sep=""),row.names=1)
 MO_filtered_matrix = as.matrix(MO_filtered)
 MO_filtered_CSC <- as((MO_filtered_matrix), "dgCMatrix")
 ```
@@ -42,7 +38,8 @@ MO_sc1 = SoupChannel(MO_unfiltered_gene,MO_filtered_CSC)
 ```
 
 ```{r}
-MO_clusters <- read.csv(file = paste('SoupX/Killi/processed_WL_Kilifish_01252026.h5ad_leiden_clusters.csv',sep =""),row.names=1)
+#Input leiden clusters from SAM
+MO_clusters <- read.csv(file = paste('../../SoupX/DR/preprocessed_DanioRerio1.h5ad_leiden_clusters.csv',sep =""),row.names=1)
 ```
 
 ```{r}
@@ -53,7 +50,7 @@ MO_sc1_clus = setClusters(MO_sc1, setNames(MO_clusters$leiden_clusters, rownames
 MO_sc1_clus <- autoEstCont(MO_sc1_clus, soupQuantile = .2)
 ```
 ```{r}
-MO_sc1_clus = setContaminationFraction(MO_sc1_clus, 0.025)
+MO_sc1_clus = setContaminationFraction(MO_sc1_clus, 0.015)
 ```
 
 ```{r}
@@ -117,6 +114,7 @@ write_dgCMatrix_csv <- function(mat,
 ```
 
 ```{r}
-write_dgCMatrix_csv(MO_out1,filename = paste("SoupX/Killi/", "processedrun_WL_killi_soupcorr.csv",sep = ""))
+#Output name
+write_dgCMatrix_csv(MO_out1,filename = paste("",sep = ""))
 ```
 
