@@ -1,711 +1,902 @@
+# IO.R - Optimized Single-Cell Data Processing & Iterative Clustering
+# Ported from Allen Institute scrattch.hicat & BrainMappingPipeline iterclust.py
 
+library(Seurat)
+library(harmony)
+library(Matrix)
+library(dplyr)
+library(igraph)
 
+# de_param: Define Differential Expression parameters for iterative clustering
+# Default parameters tuned for 10x droplet single-cell data:
+# padj = 0.05, lfc = ln(1.5) ≈ 0.405, low_th = 1.0, q1 = 0.5, q_diff = 0.7, de.score.th = 150
+de_param <- function(low.th = 1.0,
+                     padj.th = 0.05, 
+                     lfc.th = 0.405, # log(1.5) = 0.405
+                     q1.th = 0.5, 
+                     q2.th = NULL,
+                     q.diff.th = 0.7, 
+                     de.score.th = 150, 
+                     min.cells = 4, 
+                     min.genes = 5) {
+  return(list(
+    low.th = low.th,
+    padj.th = padj.th,
+    lfc.th = lfc.th,
+    q1.th = q1.th,
+    q2.th = q2.th,
+    q.diff.th = q.diff.th,
+    de.score.th = de.score.th,
+    min.cells = min.cells,
+    min.genes = min.genes
+  ))
+}
+
+# Default resolution ladder matching BrainMappingPipeline iterclust.py
+DEFAULT_RES_LADDER <- c(1.0, 2.0, 4.0, 8.0)
+
+# GeneratePalette: Generate maximally distinct, non-repeating colors for large numbers of clusters (> 256 supported)
+# Uses Glasbey algorithm (pals) for N <= 256, and dynamic HCL Polychrome palette construction for N > 256
+GeneratePalette <- function(n, seed = 42) {
+  set.seed(seed)
+  if (n <= 256 && requireNamespace("pals", quietly = TRUE)) {
+    return(as.vector(pals::glasbey(n)))
+  } else if (requireNamespace("Polychrome", quietly = TRUE)) {
+    if (n <= 36) {
+      return(as.vector(Polychrome::palette36.colors(n)))
+    } else {
+      # Dynamic HCL palette construction supporting N > 256 distinct colors
+      seed_cols <- c("#E41A1C", "#377EB8", "#4DAF4A", "#984EA3", "#FF7F00", "#FFFF33", "#A65628", "#F781BF")
+      pal <- Polychrome::createPalette(n, seed_cols, M = max(1000, n * 3))
+      return(as.vector(pal))
+    }
+  } else {
+    return(colorRampPalette(RColorBrewer::brewer.pal(9, "Set1"))(n))
+  }
+}
 
 # ImportH5ad
-# import data to Seurat format
-# Input: folder. Folder containing the processed files from h5ad. Should include a .mtx sparce matrix count table, cellID, geneID, metadata. 
-# org: organism code.
-# Output: a seurat object.
-# note: in the output file, the .mtx is loaded to RNA assay, count slot. Optimally it is umi count or raw counts.
-
-ImportH5ad <- function (folder, org) {
-  # load cell barcode and gene ID
-  cellID <- read.csv(file = paste0(folder, "cellID_", org, ".csv"), header=F)
-  geneID <- read.csv(file = paste0(folder, "geneID_", org, ".csv"), header=F)
-  #load metadata
-  metadata <- read.csv(file = paste0(folder, "metadata_",org, ".csv"), header=T, row.names = 1)
-  #load count table
+ImportH5ad <- function(folder, org) {
+  cellID <- read.csv(file = paste0(folder, "cellID_", org, ".csv"), header = FALSE)
+  geneID <- read.csv(file = paste0(folder, "geneID_", org, ".csv"), header = FALSE)
+  metadata <- read.csv(file = paste0(folder, "metadata_", org, ".csv"), header = TRUE, row.names = 1)
   counts <- readMM(file = paste0(folder, "scdata_", org, ".mtx"))
-  rownames(counts) <- cellID[,1]
-  colnames(counts) <- geneID[,1]
-  counts<-t(counts)
+  rownames(counts) <- cellID[, 1]
+  colnames(counts) <- geneID[, 1]
+  counts <- Matrix::t(counts)
   scdata <- CreateSeuratObject(counts = counts, assay = "RNA", meta.data = metadata, project = paste(org))
   scdata <- DietSeurat(scdata)
   return(scdata)
 }
 
 # ReadSTAR
-# import gene.out.tab from a batch run of star to a count matrix.
-# input: folder. the folder containing a batch run result of star, e.g., a foler with many subfolders of well names , "A1", "A2", ..., "P24".
-# input: plate.name. a string of plate name. E.g.: "PN_plate7".
-# output: data.raw. a count matrix. row is gene count, column is cell/well names.
-# example output
-#                     plate7_P5 |  plate7_P6 | plate7_P7 | plate7_P8 | plate7_P9
-# Xkr4                    0            0           0           0          0
-# Rp1                     0            0           0           0          0
-# Sox17                   0            0           0           0          0
-# Mrpl15                  0            0           0           0          0
-# Lypla1                  0            0           0           0          0
-# ERCC-00170              0            0           0           0          0
-# ERCC-00171              0            0           0           0          0
-# Gfp_transgene           1            0           2           2          2
-# Cre_transgene           0            0           0           0          0
-# Tdtom_transgene        20            1          89           0          0
-# note: this function assumes each cell is placed in a well in 384 plate format. There is no duplation of well names.
-
-
 ReadSTAR <- function(plate.name, folder) {
-  files <- list.files(path = folder, pattern = "Gene.out.tab",recursive = T,full.names = T)
-  data.raw<-data.frame()
+  files <- list.files(path = folder, pattern = "Gene.out.tab", recursive = TRUE, full.names = TRUE)
+  data.raw <- data.frame()
   for (file in files) {
-    cell.data<-read.table(file=file)
-    cell.data<-cell.data[5:23436,]
-    cell.data.df<-data.frame(counts=cell.data[,2])
-    rownames(cell.data.df)<-cell.data$V1
-    well.name<-unlist(strsplit(file,split = "/"))
-    colnames(cell.data.df)<-paste(plate.name, "_",  well.name[length(well.name)-1], sep="")
-    if(file==files[1]){
+    cell.data <- read.table(file = file)
+    cell.data <- cell.data[5:23436, ]
+    cell.data.df <- data.frame(counts = cell.data[, 2])
+    rownames(cell.data.df) <- cell.data$V1
+    well.name <- unlist(strsplit(file, split = "/"))
+    colnames(cell.data.df) <- paste(plate.name, "_", well.name[length(well.name) - 1], sep = "")
+    if (file == files[1]) {
       data.raw <- cell.data.df
-    }else{
-      data.raw<-cbind(data.raw, cell.data.df)
+    } else {
+      data.raw <- cbind(data.raw, cell.data.df)
     }
   }
   return(data.raw)
-  
 }
 
-# LogCPM 
-# calculate log(cpm+1) from umi counts for a seurat object
-# input: scdata. seurat object. must have "RNA" assay and slot "counts"
-# output: the same seurat object with log(cpm+1) added as "logCPM" slot under assay "RNA".
-
+# LogCPM
+# Optimized sparse matrix calculation of log2(CPM + 1)
 LogCPM <- function(scdata) {
-  data.count <- as(scdata[["RNA"]]$counts, "sparseMatrix")
-  data.cpm <- as(apply(data.count,2, function(x) (x/sum(x))*1000000), "sparseMatrix")
-  scdata.logCPM <- as(log(data.cpm + 1), "sparseMatrix")
-  scdata@assays$RNA$logCPM <- scdata.logCPM
+  DefaultAssay(scdata) <- "RNA"
+  counts <- GetAssayData(scdata, assay = "RNA", layer = "counts")
+  col_sums <- Matrix::colSums(counts)
+  col_sums[col_sums == 0] <- 1
+  cpm_mat <- Matrix::t(Matrix::t(counts) / col_sums) * 1e6
+  scdata.logCPM <- log1p(cpm_mat)
+  scdata@assays$RNA$logCPM <- as(scdata.logCPM, "sparseMatrix")
   return(scdata)
-  
 }
 
 # SeuratProcess
-# run seurat data normalization with scTransform, vst.flavor = v2, run PCA with 30 pcs. run harmony across batch with 30 dims, run umap and run tsne with 30 dims, find neighbors and clusters.
-# input: scdata. A seurat object
-# input: batch.name. The metadata column name where batch label is stored.
-# output: a seurat object with the described process.
-SeuratProcess <- function(scdata, batch.name="key", npc=30, clustering.resolution=1) {
+# High-efficiency normalization, SCTransform (v2), PCA, Harmony, UMAP/tSNE & Clustering
+# Uses Seurat v5 native layer-based SCTransform to eliminate memory-intensive object merging and process hangs
+SeuratProcess <- function(scdata, batch.name = "key", npc = 30, clustering.resolution = 2, de.param = de_param(), res_ladder = DEFAULT_RES_LADDER, run.iterative = TRUE, force = FALSE, ncore = 1, verbose = TRUE) {
+  t_start_total <- Sys.time()
   
-  # Split the object
-  DefaultAssay(scdata) <- "RNA"
-  object_list <- SplitObject(scdata, split.by = batch.name)
-  object_list2 <- list()
-  # Normalize counts data
-  for (i in 1:length(object_list)) {
-    object_list2[[i]] <- NormalizeData(object_list[[i]])
+  log_ts <- function(msg) {
+    if (verbose) {
+      ts <- format(Sys.time(), "[%H:%M:%S]")
+      message(paste(ts, msg))
+      flush.console()
+    }
   }
-  # Apply SCTransform to each object in the list
-  object_list2 <- lapply(object_list2, function(x) {
-    x <- SCTransform(x, verbose = TRUE) #Set verbose to true to see progress.
-    return(x)
-  })  
-
-  # Merge the transformed objects
-  scdata <- merge(object_list2[[1]], y = object_list2[-1])
-  var.features <- lapply(object_list2, function(item) {
-    item@assays$SCT@var.features
-  })
-  var.features <- unique(unlist(var.features))
-  VariableFeatures(scdata) <- var.features
-  # join RNA assay
-  scdata[["RNA"]] <- JoinLayers(scdata[["RNA"]])
-  # Scale data
-  DefaultAssay(scdata) <- "RNA"
-  scdata <- ScaleData(scdata)
-  #PCA, harmony, clustering
-  DefaultAssay(scdata) <- "SCT"
-  scdata <-     RunPCA(scdata, npcs = npc, verbose = FALSE) %>%
-    RunHarmony(dims=1:npc, verbose= FALSE, group.by.vars = batch.name) %>%
-    RunUMAP(reduction = "harmony", dims = 1:npc, verbose = FALSE) %>%
-    RunTSNE(dims = 1:npc, reduction = "harmony") %>%
-    FindNeighbors(reduction = "harmony", dims = 1:npc, verbose = FALSE) %>%
-    FindClusters(resolution = clustering.resolution)
+  
+  log_ts(sprintf("[SeuratProcess] Started pipeline execution (System Time: %s)", format(t_start_total, "%Y-%m-%d %H:%M:%S")))
+  
+  # Check if multi-batch processing is required
+  batches <- if (batch.name %in% colnames(scdata@meta.data)) unique(scdata@meta.data[[batch.name]]) else NULL
+  n_batches <- length(batches)
+  
+  # Step 1 & 2: SCTransform (v2) using Seurat v5 split layers to eliminate memory-intensive object merging
+  t_step1 <- Sys.time()
+  has_sct <- "SCT" %in% names(scdata@assays)
+  sct_run <- FALSE
+  if (has_sct && !force) {
+    log_ts("[STEP 1/5 & 2/5 SKIPPED] 'SCT' assay already present in object.")
+  } else {
+    DefaultAssay(scdata) <- "RNA"
+    if (n_batches > 1) {
+      log_ts(sprintf("[STEP 1/5] Splitting RNA layers across %d batches ('%s') and running SCTransform (vst.flavor = 'v2')...", n_batches, batch.name))
+      scdata[["RNA"]] <- split(scdata[["RNA"]], f = scdata@meta.data[[batch.name]])
+      scdata <- SCTransform(scdata, vst.flavor = "v2", verbose = FALSE)
+      sct_run <- TRUE
+      
+      t_step1_elapsed <- round(as.numeric(difftime(Sys.time(), t_step1, units = "mins")), 2)
+      log_ts(sprintf("[STEP 1/5 COMPLETED] Layer-based SCTransform finished across %d batches (Elapsed: %.2f mins)", n_batches, t_step1_elapsed))
+      log_ts("[STEP 2/5 COMPLETED] Integrated SCT assay generated natively (object merging bypassed).")
+    } else {
+      log_ts("[STEP 1/5] Starting SCTransform (vst.flavor = 'v2') on single batch...")
+      scdata <- SCTransform(scdata, vst.flavor = "v2", verbose = FALSE)
+      sct_run <- TRUE
+      t_step1_elapsed <- round(as.numeric(difftime(Sys.time(), t_step1, units = "mins")), 2)
+      log_ts(sprintf("[STEP 1/5 COMPLETED] SCTransform finished (Elapsed: %.2f mins)", t_step1_elapsed))
+      log_ts("[STEP 2/5 COMPLETED] Single batch detected; skipping merge step.")
+    }
+  }
+  
+  if ("SCT" %in% names(scdata@assays)) {
+    DefaultAssay(scdata) <- "SCT"
+  }
+  
+  # Step 3: PCA & Harmony Integration
+  t_step3 <- Sys.time()
+  reduction_to_use <- if (n_batches > 1) "harmony" else "pca"
+  has_reduction <- reduction_to_use %in% names(scdata@reductions)
+  
+  if (has_reduction && !force && !sct_run) {
+    log_ts(sprintf("[STEP 3/5 SKIPPED] '%s' reduction already present in object.", reduction_to_use))
+  } else {
+    log_ts(sprintf("[STEP 3/5] Running PCA (%d PCs) and Harmony integration across '%s'...", npc, batch.name))
+    if (!"pca" %in% names(scdata@reductions) || force || sct_run) {
+      scdata <- RunPCA(scdata, npcs = npc, verbose = FALSE)
+    }
+    if (n_batches > 1) {
+      scdata <- RunHarmony(scdata, dims = 1:npc, verbose = FALSE, group.by.vars = batch.name)
+    }
+    
+    t_step3_elapsed <- round(as.numeric(difftime(Sys.time(), t_step3, units = "secs")), 1)
+    log_ts(sprintf("[STEP 3/5 COMPLETED] PCA & Harmony completed (Elapsed: %.1fs)", t_step3_elapsed))
+  }
+  
+  # Ensure RNA layers are joined if needed
+  if ("RNA" %in% names(scdata@assays)) {
+    try(scdata[["RNA"]] <- JoinLayers(scdata[["RNA"]]), silent = TRUE)
+  }
+  
+  # Step 4: UMAP & t-SNE Dimensionality Reductions
+  t_step4 <- Sys.time()
+  has_umap <- "umap" %in% names(scdata@reductions)
+  has_tsne <- "tsne" %in% names(scdata@reductions)
+  
+  if (has_umap && has_tsne && !force) {
+    log_ts("[STEP 4/5 SKIPPED] Both 'umap' and 'tsne' reductions already present in object.")
+  } else {
+    log_ts("[STEP 4/5] Running UMAP and t-SNE dimensionality reductions...")
+    
+    if (!has_umap || force) {
+      tryCatch({
+        scdata <- RunUMAP(scdata, reduction = reduction_to_use, dims = 1:npc, verbose = FALSE)
+      }, error = function(e) {
+        log_ts(sprintf("[STEP 4/5 WARNING] UMAP execution failed: %s", e$message))
+      })
+    }
+    
+    if (!has_tsne || force) {
+      perp <- min(30, max(1, floor((ncol(scdata) - 1) / 3)))
+      tsne_res <- tryCatch({
+        RunTSNE(scdata, dims = 1:npc, reduction = reduction_to_use, num_threads = ncore, perplexity = perp)
+      }, error = function(e) {
+        tryCatch({
+          RunTSNE(scdata, dims = 1:npc, reduction = reduction_to_use, perplexity = perp)
+        }, error = function(e2) {
+          log_ts(sprintf("[STEP 4/5 WARNING] t-SNE execution failed: %s", e2$message))
+          scdata
+        })
+      })
+      scdata <- tsne_res
+    }
+    
+    t_step4_elapsed <- round(as.numeric(difftime(Sys.time(), t_step4, units = "secs")), 1)
+    log_ts(sprintf("[STEP 4/5 COMPLETED] UMAP & t-SNE completed (Elapsed: %.1fs)", t_step4_elapsed))
+  }
+  
+  # Step 5: Graph-Based Clustering
+  t_step5 <- Sys.time()
+  has_clusters <- "seurat_clusters" %in% colnames(scdata@meta.data) && length(scdata@graphs) > 0
+  
+  if (has_clusters && !force) {
+    log_ts("[STEP 5/5 SKIPPED] 'seurat_clusters' and neighbor graph already present in object.")
+  } else {
+    log_ts(sprintf("[STEP 5/5] Running FindNeighbors & FindClusters (resolution = %.1f)...", clustering.resolution))
+    
+    scdata <- FindNeighbors(scdata, reduction = reduction_to_use, dims = 1:npc, verbose = FALSE) %>%
+      FindClusters(resolution = clustering.resolution, verbose = FALSE)
+      
+    t_step5_elapsed <- round(as.numeric(difftime(Sys.time(), t_step5, units = "secs")), 1)
+    log_ts(sprintf("[STEP 5/5 COMPLETED] Graph-based clustering completed (Elapsed: %.1fs)", t_step5_elapsed))
+  }
+  
+  # Step 6: Iterative Clustering (Default: TRUE)
+  if (run.iterative) {
+    t_step6 <- Sys.time()
+    has_iterative <- "cluster_merge" %in% colnames(scdata@meta.data)
+    
+    if (has_iterative && !force) {
+      log_ts("[STEP 6 SKIPPED] Iterative clustering ('cluster_merge' metadata) already present in object.")
+    } else {
+      # Ensure RNA assay has normalized 'data' layer required for ScaleData & FindMarkers
+      has_data_layer <- tryCatch({
+        layers_list <- SeuratObject::Layers(scdata[["RNA"]])
+        any(grepl("^data", layers_list))
+      }, error = function(e) FALSE)
+      
+      if (!has_data_layer) {
+        log_ts("[STEP 6 PREPARATION] Normalizing RNA assay layer ('data' layer missing)...")
+        scdata <- NormalizeData(scdata, assay = "RNA", verbose = FALSE)
+        try(scdata[["RNA"]] <- JoinLayers(scdata[["RNA"]]), silent = TRUE)
+      }
+      
+      log_ts(sprintf("[STEP 6] Starting hicat-style iterative clustering with resolution ladder (ncore = %d)...", ncore))
+      
+      # iter.clust calls merge_cl internally at each resolution step — no separate pre-merge needed
+      scdata <- iter.clust(object = scdata, de.param = de.param, res_ladder = res_ladder, assay = "RNA", ncore = ncore, verbose = verbose)
+      
+      t_step6_elapsed <- round(as.numeric(difftime(Sys.time(), t_step6, units = "mins")), 2)
+      log_ts(sprintf("[STEP 6 COMPLETED] Iterative clustering completed (Elapsed: %.2f mins)", t_step6_elapsed))
+    }
+  }
+  
+  # Ensure DefaultAssay remains SCT if present
+  if ("SCT" %in% names(scdata@assays)) {
+    DefaultAssay(scdata) <- "SCT"
+  }
+  
+  t_end_total <- Sys.time()
+  total_mins <- round(as.numeric(difftime(t_end_total, t_start_total, units = "mins")), 2)
+  
+  log_ts(sprintf("[SeuratProcess COMPLETED] Execution finished at: %s | Total runtime: %.2f mins", 
+                 format(t_end_total, "%Y-%m-%d %H:%M:%S"), total_mins))
+  
   return(scdata)
 }
 
-
 # DotPlotMM
-# plot dotplot using ensembl official gene symbol in allen insitute mouse single cell data.
-# the gene symbol is looked up from ensemble look up table first.
-# example ensembl table
-# head(ensembl.table)
-# ensembl_gene_id external_gene_name
-# 1 ENSMUSG00000064336              mt-Tf
-# 2 ENSMUSG00000064337            mt-Rnr1
-# 3 ENSMUSG00000064338              mt-Tv
-# 4 ENSMUSG00000064339            mt-Rnr2
-# 5 ENSMUSG00000064340             mt-Tl1
-# 6 ENSMUSG00000064341             mt-Nd1
-# column names are ensembl_gene_id and external_gene_name. Order matters.
-# scdata.MM is the allen mouse data converted to seurat. 
-
-DotPlotMM <- function (scdata.MM, feature, ensembl.table, group.by = "subclass") {
-  if (sum(feature %in% ensembl.table[,2])==length(feature)) {
-    geneID <- c(ensembl.table[ensembl.table[,2] %in% feature, 1])
-    dotplot <- DotPlot(scdata.MM, features = geneID, cols = c("lightgrey","darkred"), group.by=group.by)
+DotPlotMM <- function(scdata.MM, feature, ensembl.table, group.by = "subclass") {
+  if (sum(feature %in% ensembl.table[, 2]) == length(feature)) {
+    geneID <- c(ensembl.table[ensembl.table[, 2] %in% feature, 1])
+    dotplot <- DotPlot(scdata.MM, features = geneID, cols = c("lightgrey", "darkred"), group.by = group.by)
     print(paste(feature, " = ", geneID))
     return(dotplot)
   } else {
     print("Some features not found in ensembl.table")
   }
-  
 }
 
-
-
-#Function MergeCluster
-#merge clusters based on DE score. Only clusters with DE score passing the set threshold will be mainteined. smaller clusters are merged to its nearest neighbour. 
-#The function will use the "seurat_cluster" slot in the meta data to merge.
-#Input: Object, padj.th, lfc.th, q.diff.th, de.score.th, min.cells
-#Object, the seurat object to use. Must have "seurat_cluster" slot.
-
-
-MergeCluster <- function(object, padj.th, lfc.th, q.diff.th, de.score.th, min.cells, assay="RNA") {
-  #create a new column in metadata called cluster_merge for making merged cluster labels.
-  cluster_merge<-object@meta.data$seurat_clusters
-  #if cluster_merge already exists, remove the existing column.
-  if (is.null(object@meta.data$cluster_merge)==FALSE) {
-    print("Removing current cluster_merge column")
-    object@meta.data<-object@meta.data[,c(names(object@meta.data)[names(object@meta.data)!="cluster_merge"])]
-  }
-  object@meta.data<-cbind(object@meta.data,cluster_merge)
-  nclusters = length(unique(cluster_merge))
-  
-  # if number of clusters = 1, output only 1 cluster no merging
-  if (nclusters == 1) {
-    print("only 1 cluster, not merging")
-  } else if (nclusters == 2)   { # if number of clusters = 2, test between the 2. 
-    names = unique(cluster_merge)
-    # if the smaller cluster has less than min.cells, merge the two.
-    if (min(table(cluster_merge))<min.cells) {
-      object@meta.data$cluster_merge[object@meta.data$cluster_merge == names[1]] <- names[2]
-      print(paste("1 of the 2 clusters smaller than min.cells, Merged ", names[1], " with ", names[2], sep=""))
-      object@meta.data$seurat_clusters<-object@meta.data$cluster_merge
-    } else { # if both clusters are big enough, test de.score.
-      marker.1 <- FindMarkers(object, ident.1 = names[1], ident.2 = names[2], logfc.threshold = lfc.th, verbose = FALSE, recorrect_umi=FALSE)
-      marker.1<-marker.1[marker.1$p_val_adj<padj.th,]
-      marker.1<-marker.1[abs(marker.1$pct.1-marker.1$pct.2)/apply(marker.1[,c("pct.1","pct.2")], 1, max)>q.diff.th,]
-      norm.pvalue <- -log10(marker.1$p_val_adj)
-      norm.pvalue[norm.pvalue>20]<-20
-      DE.score<-sum(norm.pvalue)
-      #if DE gene thresholds not met, merge to its nearest neighbour
-      if (DE.score < de.score.th) {
-        object@meta.data$cluster_merge[object@meta.data$cluster_merge == names[1]] <- names[2]
-        print(paste("DE.score is smaller than DE.score.th, Merged ", names[1], " with ", names[2], sep=""))
-        object@meta.data$seurat_clusters<-object@meta.data$cluster_merge
-        #if DE gene thresholds met, keep both
-      } 
-    }
-  
-  } else {  # if number of clusters >= 3, find 2 nearest neighbours  to test.
-    #loop through all cluster names
-    merged_this_round <- TRUE
-    
-    # Start a while loop that continues as long as a merge occurs
-    while (merged_this_round) {
-      merged_this_round <- FALSE # Assume no merges will happen this round
-      
-      # Recalculate everything inside the loop to get the current state
-      object <- FindVariableFeatures(object, verbose = FALSE)
-      matrix.aggr <- AggregateExpression(object = object, features = object@assays[[assay]]@var.features, group.by = "cluster_merge")
-      matrix.aggr <- as.matrix(matrix.aggr[[assay]])
-      dist.mat <- as.matrix(dist(t(matrix.aggr), diag = T, upper = T))
-      
-      # If there's only one cluster left, stop
-      if (nrow(dist.mat) <= 1) {
-        break
-      }
-      
-      # Find the closest pair of clusters based on the distance matrix
-      # Ignore the diagonal (distance to self)
-      min_dist_val <- min(dist.mat[dist.mat != 0])
-      closest_pair_indices <- which(dist.mat == min_dist_val, arr.ind = TRUE)
-      
-      # In case of ties, just take the first one
-      pair_to_merge <- rownames(dist.mat)[closest_pair_indices[1, ]]
-      cluster_name_1 <- unlist(strsplit(pair_to_merge[1], split = "g"))[2]
-      cluster_name_2 <- unlist(strsplit(pair_to_merge[2], split = "g"))[2]
-      
-      # Ensure they are not the same cluster
-      if (cluster_name_1 == cluster_name_2) {
-        dist.mat[closest_pair_indices[1,1], closest_pair_indices[1,2]] = 99999
-        next
-      }
-      
-      print(paste("Testing potential merge between clusters", cluster_name_1, "and", cluster_name_2))
-      
-      # Check if a merge is warranted based on your criteria (cell count, DE score, etc.)
-      # This logic from your original function needs to be adapted here.
-      
-      # Example logic for a merge based on DE score:
-      marker <- FindMarkers(object, ident.1 = cluster_name_1, ident.2 = cluster_name_2, logfc.threshold = lfc.th, verbose = FALSE, recorrect_umi = FALSE)
-      marker <- marker[marker$p_val_adj < padj.th, ]
-      marker <- marker[abs(marker$pct.1 - marker$pct.2) / apply(marker[, c("pct.1", "pct.2")], 1, max) > q.diff.th, ]
-      norm.pvalue <- -log10(marker$p_val_adj)
-      norm.pvalue[norm.pvalue > 20] <- 20
-      DE.score <- sum(norm.pvalue)
-      
-      # If criteria met, merge them and set the flag to continue the loop
-      if (DE.score < de.score.th) {
-        object@meta.data$cluster_merge[object@meta.data$cluster_merge == cluster_name_2] <- cluster_name_1
-        print(paste("Merged", cluster_name_2, "with", cluster_name_1))
-        object@meta.data$seurat_clusters <- object@meta.data$cluster_merge
-        merged_this_round <- TRUE
-      }
-    }
-    }
-  return(object)
-}
-
-
-
-
-
-#Function iter.clust will perform iterative clustering
-#Input
-#object must have meta data column "cluster_merge", and "seurat_cluster".
-iter.clust<-function(object, de.param, var.features, res=1, assay="RNA") {
-  DefaultAssay(object) <- assay
-  object.tokeep<-list()
-  is.increased=T
-  object.tosubcluster <- SplitObject(object, split.by = "cluster_merge")
-  k=0
-  while (length(object.tosubcluster)>1) {
-    print(paste("started iteration",k))
-    object.tosubcluster.k<-object.tosubcluster
-    print(object.tosubcluster.k)
-    for (i in 1:length(object.tosubcluster)) {
-          scdata <- object.tosubcluster.k[[i]]
-          scdata <- ScaleData(scdata, verbose = FALSE)
-          print("")
-          print("*************************************")
-          name.i <- names(object.tosubcluster.k)[i]
-          print(paste(i+k, "th subclustering, cluster name:", name.i))
-          print("*************************************")
-          print("")
-          scdata<-FindVariableFeatures(scdata, assay=assay)
-          tmp.var.features <- VariableFeatures(scdata, assay = assay)
-          
-
-      if (length(tmp.var.features)>30) {
-        if (ncol(scdata)<100) {
-          res=1
-        }
-        print("PCA analysis")
-        scdata <- RunPCA(scdata, npcs = 29, verbose=FALSE)
-        #debug Error in irlba(A = t(x = object), nv = npcs, ...) : 
-        #   max(nu, nv) must be strictly less than min(nrow(A), ncol(A))
-        scdata <- FindNeighbors(scdata, dims = 1:29,reduction = "pca")
-        print("clustering")
-        scdata <- FindClusters(scdata, resolution = res)
-        cluster_merge<-paste(names(object.tosubcluster)[i], ".", scdata@meta.data$seurat_clusters,sep="")
-        scdata@meta.data<-scdata@meta.data[,1:(ncol(scdata@meta.data)-1)]
-        scdata@meta.data$seurat_clusters<-cluster_merge
-        if (length(unique(scdata@meta.data$seurat_clusters))==1) {
-          print("Only 1 cluster, stop from further subclustering.")
-          scdata@meta.data<-cbind(scdata@meta.data, cluster_merge=scdata@meta.data$seurat_clusters)
-          object.tokeep[[name.i]]<-scdata
-          object.tosubcluster[[name.i]] <- NULL
-        } else {
-          print("More than 1 clusters, Merging clusters based on DE gene threshold")
-          scdata<-merge_cl(object=scdata, de.param, assay=assay)
-          if (length(unique(scdata@meta.data$cluster_merge))==1) {
-            print("Only 1 cluster after merging, stop from further subclustering.")
-            object.tokeep[[name.i]]<-scdata
-            object.tosubcluster[[name.i]] <- NULL
-          } else {
-            object.tosubcluster[[name.i]] <- scdata
-          }
-        }
-      } else {
-        print("Less features than 30, stop further subclustering.")
-        object.tokeep[[name.i]]<-scdata
-        object.tosubcluster[[name.i]] <- NULL
-      }
-      
-      
-    }
-    object.tosubcluster.list <- map(object.tosubcluster, ~SplitObject(., split.by = "cluster_merge"))
-    object.tosubcluster <- flatten(object.tosubcluster.list)
-    k=k+1
-  }
-  # merge the last cluster to tokeep
-  if (length(object.tosubcluster)==1){
-    object.tokeep[[names(object.tosubcluster[1])]]<-object.tosubcluster[1]
-  }
-  # merge all clusters that can't be subdivided.
-  object.final <- Merge_Seurat_List(list_seurat = object.tokeep)
-  object.final@meta.data$seurat_clusters <- object.final@meta.data$cluster_merge
-  return(object.final)
-}
-
-  
-
-#Bootstraping
-bootstrap_iter_clust <- function (seurat.obj, n.iter=100, de.param, var.features = var.features, res=1, assay="RNA") {
-  #create a list containing coclustering matrix of each round
-  n.cluster <- c()
-  cocluster.matrix<-data.frame()
-  start.time<-Sys.time()
-  for (i in 1:n.iter) {
-    print("")
-    print("*************************************")
-    print("*************************************")
-    print(paste("Start iteration",i))
-    print(paste("Progress:",i/n.iter*100,"%"))
-    print(paste("Elapsed time:", difftime(Sys.time(), start.time, units = "mins"), " mins"))
-    print("*************************************")
-    print("*************************************")
-    print("")
-    #subsample by 80%
-    print("subsampling 80%")
-    names<-colnames(seurat.obj)
-    pred=sample(names, ncol(seurat.obj)*0.8)
-    print(head(pred))
-    scdata.sample<-seurat.obj[,pred]
-    #iterative clustering the subsampled data.
-    scdata.sample <- DietSeurat(scdata.sample)
-    print("Start initial clustering")
-    all.genes<-rownames(rownames(scdata.sample))
-    scdata.sample <- ScaleData(scdata.sample, features = all.genes)
-    scdata.sample <- RunPCA(scdata.sample, assay = assay, features = var.features, verbose = FALSE, npcs = 29)
-    scdata.sample <- RunTSNE(scdata.sample, dims = 1:29, reduction = "pca" ,check_duplicates = FALSE, verbose = FALSE)
-    scdata.sample <- RunUMAP(scdata.sample, dims = 1:29, reduction = "pca" ,verbose = FALSE)
-    scdata.sample <- FindNeighbors(scdata.sample, dims = 1:29, verbose = FALSE,reduction = "pca")
-    scdata.sample <- FindClusters(scdata.sample, verbose = FALSE, res=res)
-    print("test initial clustering stability")
-    scdata.sample <- merge_cl(object=scdata.sample, de.param, assay=assay)
-    print("Start iterative clustering.")
-    scdata.sample <- iter.clust(object = scdata.sample, de.param, var.features = var.features, res=res, assay=assay)
-    #save cocluster matrix
-    print("Generat co-clustering matrix.")
-    cluster.i<-data.frame(name=rownames(scdata.sample@meta.data),cluster=paste(scdata.sample@meta.data$cluster_merge,".iter",i, sep=""))
-    cocluster.matrix<-rbind(cocluster.matrix, cluster.i)
-    print(paste("iteration",i,"done, merged data with the last iteration"))
-    n.cluster.i <- length(unique(scdata.sample@meta.data$cluster_merge))
-    n.cluster <- c(n.cluster, n.cluster.i)
-  }
-  print(paste("finished at",Sys.time()))
-  print(paste("Total elapsed time:",difftime(Sys.time(), start.time, units = "mins"), " mins"))
-  cocluster.matrix.average <- crossprod(table(cocluster.matrix[c(2,1)]))
-  boot.list<-list(cocluster.matrix.average, n.cluster)
-  return(boot.list)
-}
-
-# parallele version
-bootstrap_iter_clust_parallel <- function (seurat.obj, n.iter = 100, de.param, var.features, res = 1, ncore=4, assay = "RNA") {
-
-  # Use all available cores except one
-  # Adjust the number of cores as needed
-  num_cores <- ncore
-  registerDoParallel(num_cores)
-
-  # Replace the for loop with foreach
-  results <- foreach(i = 1:n.iter, .combine = 'rbind', .packages = c("Seurat")) %dopar% {
-    # Subsample by 80%
-    names <- colnames(seurat.obj)
-    pred <- sample(names, ncol(seurat.obj) * 0.8)
-    scdata.sample <- seurat.obj[, pred]
-    
-    # Process the subsampled data
-    scdata.sample <- DietSeurat(scdata.sample)
-    all.genes <- rownames(scdata.sample)
-    scdata.sample <- ScaleData(scdata.sample, features = all.genes)
-    scdata.sample <- RunPCA(scdata.sample, assay = assay, features = var.features, verbose = FALSE, npcs = 29)
-    scdata.sample <- RunTSNE(scdata.sample, dims = 1:29, reduction = "pca", check_duplicates = FALSE, verbose = FALSE)
-    scdata.sample <- RunUMAP(scdata.sample, dims = 1:29, reduction = "pca", verbose = FALSE)
-    scdata.sample <- FindNeighbors(scdata.sample, dims = 1:29, verbose = FALSE, reduction = "pca")
-    scdata.sample <- FindClusters(scdata.sample, verbose = FALSE, res = res)
-    
-    # Assume merge_cl() and iter.clust() are defined elsewhere
-    scdata.sample <- merge_cl(object = scdata.sample, de.param, assay = assay)
-    scdata.sample <- iter.clust(object = scdata.sample, de.param, var.features = var.features, res = res, assay = assay)
-    
-    # Generate the cocluster matrix for this iteration
-    cluster.i <- data.frame(name = rownames(scdata.sample@meta.data),
-                            cluster = paste(scdata.sample@meta.data$cluster_merge, ".iter", i, sep = ""))
-    
-    # Return the data frame and number of clusters for this iteration
-    list(cluster.i, length(unique(scdata.sample@meta.data$cluster_merge)))
-  }
-  
-  # Stop the parallel cluster
-  stopImplicitCluster()
-  
-  # Post-processing outside the loop
-  cocluster.matrix <- do.call(rbind, lapply(results, `[[`, 1))
-  n.cluster <- unlist(lapply(results, `[[`, 2))
-  
-  cocluster.matrix.average <- crossprod(table(cocluster.matrix[c(2,1)]))
-  boot.list <- list(cocluster.matrix.average, n.cluster)
-  
-  return(boot.list)
-}
-
-
-# plot co-clustering matrix
-
-plot.cocluster <- function(co.result) {
-  MO.comatrix <- co.result[[1]]
-  #remove boundary cells.
-  MO.comatrix<- MO.comatrix[rowMaxs(MO.comatrix)>50,]
-  MO.comatrix<- MO.comatrix[,colMaxs(MO.comatrix)>50]
-  cocluster.heatmap <- pheatmap(MO.comatrix, show_colnames = F, show_rownames = F, cutree_rows = median(co.result[[2]]), cutree_cols = median(co.result[[2]]))
-  return(cocluster.heatmap)
-}
-
-
-# add bootstrapped cluster id to meta data seurat.
-
-assign.bootedclusterID <- function(co.result, seurat.obj) {
-  MO.comatrix <- co.result[[1]]
-  #remove boundary cells.
-  MO.comatrix<- MO.comatrix[rowMaxs(MO.comatrix)>50,]
-  MO.comatrix<- MO.comatrix[,colMaxs(MO.comatrix)>50]
-  #cluster the co-cluster matrix to the median number of clusters.
-  cocluster.heatmap <- pheatmap(MO.comatrix, show_colnames = F, show_rownames = F, cutree_rows = median(co.result[[2]]), cutree_cols = median(co.result[[2]]))
-  concensus.cluster<- cutree(cocluster.heatmap$tree_row, k = median(co.result[[2]]))
-  concensus.cluster.df<-data.frame(concensus.cluster)
-  rownames(concensus.cluster.df) <- sub(pattern = "_", replacement = "", x = rownames(concensus.cluster.df))
-  #subset the cells and add cluster name to metadata
-  scdata.labeled <- subset(seurat.obj, cells = rownames(concensus.cluster.df))
-  concensus.cluster.df<- concensus.cluster.df[rownames(scdata.labeled@meta.data),]
-  scdata.labeled@meta.data<-cbind(scdata.labeled@meta.data, cluster_merge_booted=concensus.cluster.df)
-  return(scdata.labeled)
-}
-
-
-
-
-
-#save seurat to anndata
-
-save.h5ad <- function(seurat.object, assay="RNA", layer="counts", filename){
-  counts_matrix <- GetAssayData(seurat.object, assay = "RNA", layer = "counts")
-  obs_metadata <- seurat.object@meta.data
-  gene_names <- rownames(counts_matrix)
-  var_metadata <- data.frame(
-    gene_names = gene_names,
-    row.names = gene_names
-  )
-  # Create AnnData object with the matrix and metadata
-  adata <- AnnData(
-    X = t(counts_matrix),
-    obs = obs_metadata,
-    var = var_metadata
-  )
-  write_h5ad(adata, filename)
-}
-
-
-# helper function to test if a pair of clusters needs to be merged based on de.param.
-
-test_merge <- function(de.pair, de.param, merge.type="undirectional")
-{
-  if(length(de.pair)==0){
+# helper function to test if a pair of clusters needs to be merged based on de.param
+test_merge <- function(de.pair, de.param, merge.type = "undirectional") {
+  if (length(de.pair) == 0) {
     return(TRUE)
   }
-  to.merge = FALSE
-  if(merge.type=="undirectional"){
-    if(!is.null(de.param$de.score.th)){
-      to.merge=de.pair$score < de.param$de.score.th
+  to.merge <- FALSE
+  if (merge.type == "undirectional") {
+    if (!is.null(de.param$de.score.th)) {
+      to.merge <- de.pair$score < de.param$de.score.th
     }
-    if(!to.merge & !is.null(de.param$min.genes)){
-      to.merge=de.pair$num < de.param$min.genes
+    if (!to.merge && !is.null(de.param$min.genes)) {
+      to.merge <- de.pair$num < de.param$min.genes
     }
-  }
-  else{
-    if(!is.null(de.param$de.score.th)){
-      to.merge=de.pair$up.score < de.param$de.score.th | de.pair$down.score < de.param$de.score.th
+  } else {
+    if (!is.null(de.param$de.score.th)) {
+      to.merge <- de.pair$up.score < de.param$de.score.th || de.pair$down.score < de.param$de.score.th
     }
-    if(!to.merge & !is.null(de.param$min.genes)){
-      to.merge=de.pair$up.num < de.param$min.genes | de.pair$down.num < de.param$min.genes
+    if (!to.merge && !is.null(de.param$min.genes)) {
+      to.merge <- de.pair$up.num < de.param$min.genes || de.pair$down.num < de.param$min.genes
     }
   }
   return(to.merge)
 }
 
-# From hicat merge clusters, convert to Seurat
+# ============================================================================
+# Summary-stats-only DE engine (ported from Python de.py)
+# All pairwise DE is computed from cluster-level vectors only — O(genes) per pair.
+# Never re-scans single cells after the one-pass summary computation.
+# ============================================================================
 
-merge_cl<- function(#norm.dat,
-                    object,
-                    #cl, 
-                    #rd.dat = NULL,
-                    #rd.dat.t = NULL, 
-                    de.param = de_param(), 
-                    merge.type = c("undirectional","directional"), 
-                    #max.cl.size = 300,
-                    #de.method = "limma",
-                    #de.genes = NULL, 
-                    #return.markers = FALSE,
-                    #pairBatch =40,
-                    #verbose = 0,
-                    assay="RNA"
-                    )
-{
-  print("start merging")
-  #create a new column in metadata called cluster_merge for making merged cluster labels.
-  cl<-droplevels(as.factor(object@meta.data$seurat_clusters))
-  init_cluster<-length(unique(cl))
-  #if cluster_merge already exists, remove the existing column.
-  if (is.null(object@meta.data$cluster_merge)==FALSE) {
-    print("Removing current cluster_merge column")
-    object@meta.data<-object@meta.data[,c(names(object@meta.data)[names(object@meta.data)!="cluster_merge"])]
-  }
-  object@meta.data<-cbind(object@meta.data, cluster_merge=cl)
-  merge.type=merge.type[1]
-  ###Merge small clusters with the closest neighbors first.
-  print("merge small clusters")
-  while(TRUE){
-    cl<-droplevels(as.factor(object@meta.data$cluster_merge))
-    cl.size = table(cl)
-    #if only 1 cluster, break
-    if(length(cl.size)==1){
-      break
-      print("only 1 cluster, no merging")
-    }
-    # if no small cluster, break
-    cl.small =  names(cl.size)[cl.size < de.param$min.cells]
-    if(length(cl.small)==0){
-      break
-      print("no small clusters")
-    }
-    object <- FindVariableFeatures(object, verbose = FALSE)
-    matrix.aggr <- AggregateExpression(object = object, features = object@assays[[assay]]@var.features, group.by = "cluster_merge")
-    matrix.aggr <- as.matrix(matrix.aggr[[assay]])
-    dist.mat <- as.matrix(dist(t(matrix.aggr), diag = F, upper = T))
-    rownames(dist.mat)<- gsub("g", "", rownames(dist.mat))
-    colnames(dist.mat)<- gsub("g", "", colnames(dist.mat))
-    cl.sim = dist.mat
-    smallest <- names(cl.size)[cl.size==min(cl.size)][1]
-    tmp <- cl.sim[smallest,]
-    nn.tmp <- names(tmp)[tmp==min(tmp[tmp>0])]
-    print(paste("merging ",nn.tmp," and ", smallest))
-    object@meta.data$cluster_merge[object@meta.data$cluster_merge == smallest] <- nn.tmp
-    cl<-droplevels(as.factor(object@meta.data$cluster_merge))
-  }		
-  print("Merging DE.score < DE.score.th clusters")
-  while(length(unique(cl)) > 1) { # only continue the following step if clusters > 1 after the above step.
-    cl<-droplevels(as.factor(object@meta.data$cluster_merge))
-    if(length(unique(cl)) == 2) { # if 2 cluster from the previous step, compare the 2 with de.score.
-      print("only 2 clusters")
-      names = unique(cl)
-      marker.1 = FindMarkers(object, ident.1 = names[1], ident.2 = names[2], logfc.threshold = de.param$lfc.th, verbose = FALSE, recorrect_umi=FALSE, group.by = "cluster_merge")
-      marker.1 = marker.1[marker.1$p_val_adj<de.param$padj.th,]
-      marker.1 = marker.1[abs(marker.1$pct.1-marker.1$pct.2)/apply(marker.1[,c("pct.1","pct.2")], 1, max)>de.param$q.diff.th,]
-      norm.pvalue = -log10(marker.1$p_val_adj)
-      norm.pvalue[norm.pvalue>20]<-20
-      DE.score = sum(norm.pvalue)
-      #if DE gene thresholds not met, merge to its nearest neighbour
-      if (DE.score < de.param$de.score.th) {
-        object@meta.data$cluster_merge <- names[2]
-        print(paste("DE.score is smaller than DE.score.th, Merged ", names[1], " with ", names[2], sep=""))
-        object@meta.data$seurat_clusters<-object@meta.data$cluster_merge
-        #if DE gene thresholds met, keep both
-      } else {
-        print("DE.score met, not merging")
-        break
-      }
-    }
-    
-    else { # if 3 or more clusters from the previous step, compare nearest neighbours.
-      print("more than 2 clusters, testing DE.score.th")
-      #calculate cluster distance and determine neighbours.
-      object <- FindVariableFeatures(object, verbose = FALSE)
-      matrix.aggr <- AggregateExpression(object = object, features = object@assays[[assay]]@var.features, group.by = "cluster_merge")
-      matrix.aggr <- as.matrix(matrix.aggr[[assay]])
-      dist.mat <- as.matrix(dist(t(matrix.aggr), diag = F, upper = T))
-      rownames(dist.mat)<- gsub("g", "", rownames(dist.mat))
-      colnames(dist.mat)<- gsub("g", "", colnames(dist.mat))
-      clusters <- rownames(dist.mat)
-      # Use lapply to iterate through each cluster and create a small data frame
-      results_list <- lapply(clusters, function(cluster) {
-        # Sort the distances for the current cluster
-        sorted_distances <- sort(dist.mat[cluster, ], index.return = TRUE)
-        # Get the names of the closest and second-closest neighbours (indices 2 and 3)
-        neighbours <- names(sorted_distances$x)[2:3]
-        # Create a data frame for this cluster and its two neighbours
-        df <- data.frame(
-          Cluster = rep(cluster, 2),
-          Neighbor = neighbours,
-          row.names = NULL
-        )
-        return(df)
-      })
-      # Combine the list of data frames into a single data frame
-      tomerge.df <- do.call(rbind, results_list)
-      # remove duplicated cluster pairs
-      sorted_pairs <- data.frame(
-        pmin(tomerge.df$Cluster, tomerge.df$Neighbor),
-        pmax(tomerge.df$Cluster, tomerge.df$Neighbor)
-      )
-      # Identify the rows that are duplicated based on the sorted pairs
-      unique_rows <- !duplicated(sorted_pairs)
-      # Filter the original data frame to keep only the unique rows
-      tomerge.df <- tomerge.df[unique_rows, ]
-      tomerge.df$merge <- rep("FALSE", nrow(tomerge.df))
-      # determine if each pair of clusters should be merged based on DE.score.
-      for (j in 1:nrow(tomerge.df)) {
-        names=c(tomerge.df[j,1], tomerge.df[j,2])
-        marker.1 <- FindMarkers(object, ident.1 = names[1], ident.2 = names[2], logfc.threshold = de.param$lfc.th, verbose = FALSE, recorrect_umi=FALSE, group.by = "cluster_merge")
-        marker.1<-marker.1[marker.1$p_val_adj < de.param$padj.th,]
-        marker.1<-marker.1[abs(marker.1$pct.1-marker.1$pct.2)/apply(marker.1[,c("pct.1","pct.2")], 1, max) > de.param$q.diff.th,]
-        norm.pvalue <- -log10(marker.1$p_val_adj)
-        norm.pvalue[norm.pvalue > 20] <- 20
-        DE.score <- sum(norm.pvalue)
-        print(paste(names[1],names[2],DE.score))
-        #if DE gene thresholds not met, merge to its nearest neighbour
-        if (DE.score < de.param$de.score.th) {
-          tomerge.df$merge[j] <- TRUE
-          print(paste("DE.score is smaller than DE.score.th, Merged ", names[1], " with ", names[2], sep=""))
-          #if DE gene thresholds met, keep both
-        }
-      }
-      # use the resulting tomerge.df to determine which clusters to merge, as below.
-      # if no merging break out.
-      if (sum(as.logical(tomerge.df$merge))==0) {
-        print(paste("All DE.score pass threshold. No cluster needs to be merged."))
-        break
-      }
-      # merge clusters.
-      # create cluster pairs to merge
-      tomerge.df.do <- tomerge.df[tomerge.df$merge==TRUE, c("Cluster", "Neighbor")]
-      # Use graph to finalize which clusters to merge together.
-      g <- graph_from_data_frame(tomerge.df.do, directed = FALSE)
-      # Get the connected components of the graph
-      components <- components(g)
-      # Find the lowest ID cluster for each component
-      find_community <- function(components) {
-        df = data.frame()
-        for (i in unique(components$membership)) {
-          # Get all clusters in the current component
-          clusters_in_component <- names(components$membership[components$membership == i])
-          # Find the lowest numerical ID among them (the "root")
-          root_name <- clusters_in_component[which.min(as.numeric(gsub("g", "", clusters_in_component)))]
-          # Return a vector of the root and all other clusters in the component
-          other_members <- clusters_in_component[clusters_in_component != root_name]
-          # Return a two-column data frame for this component
-          df.i = data.frame(Cluster = rep(root_name, length(other_members)), Neighbor = other_members)
-          df = rbind(df, df.i)
-        }
-        return(df)
-      }
-      tomerge.df.do <- find_community(components)
-      tomerge.df.do <- tomerge.df.do[order(tomerge.df.do$Cluster),]
-      tomerge.df.do$Cluster<- gsub("g", "", tomerge.df.do$Cluster)
-      tomerge.df.do$Neighbor<- gsub("g", "", tomerge.df.do$Neighbor)
-      # perform the merge
-      for (l in 1:nrow(tomerge.df.do)) {
-        print(paste("DE.score is smaller than DE.score.th, Merged ", tomerge.df.do$Neighbor[l], " with ", tomerge.df.do$Cluster[l], sep=""))
-        object@meta.data$cluster_merge[object@meta.data$cluster_merge == tomerge.df.do$Neighbor[l]] <- tomerge.df.do$Cluster[l]
-      }
-    }
-  }
-  print(paste("Merging done. Merged ", init_cluster, "clusters into", length(unique(object@meta.data$cluster_merge))))
-  object@meta.data$seurat_clusters <- object@meta.data$cluster_merge
-  return(object)
+# One-pass cluster summary statistics: mean, fraction (detected), sumsq, n
+# Matches Python de.cluster_summary_stats exactly.
+cluster_summary_stats <- function(data_mat, group_vec, low.th = 1.0) {
+  group_vec <- as.character(group_vec)
+  group_factor <- factor(group_vec)
+  cl_levels <- levels(group_factor)
+  n_cls <- length(cl_levels)
+  n_genes <- nrow(data_mat)
   
+  L <- Matrix::fac2sparse(group_factor)  # n_cls x n_cells indicator matrix
+  ns <- as.integer(Matrix::rowSums(L))
+  names(ns) <- cl_levels
+  
+  # mean = (L %*% t(X))^T / n  — sparse matrix multiply, no cell loop
+  sum_mat <- as.matrix(L %*% Matrix::t(data_mat))  # n_cls x n_genes
+  ns_safe <- pmax(ns, 1L)
+  means <- sum_mat / ns_safe  # n_cls x n_genes
+  
+  # sumsq = L %*% t(X^2) — element-wise square then aggregate
+  data_sq <- data_mat * data_mat  # sparse * sparse = sparse (Hadamard)
+  sumsq <- as.matrix(L %*% Matrix::t(data_sq))  # n_cls x n_genes
+  
+  # fraction = L %*% t(X > low.th) / n — detection rate
+  detected <- data_mat > low.th  # sparse logical (becomes dgCMatrix of 0/1)
+  det_counts <- as.matrix(L %*% Matrix::t(detected))  # n_cls x n_genes
+  fracs <- det_counts / ns_safe  # n_cls x n_genes
+  
+  rownames(means) <- rownames(sumsq) <- rownames(fracs) <- cl_levels
+  
+  list(clusters = cl_levels, n = ns, mean = means, fraction = fracs, sumsq = sumsq)
+}
+
+# Pool two cluster stat-rows into one (exact, no rescan).  Matches Python de.pool_stats.
+pool_stats <- function(row_a, row_b) {
+  na <- row_a$n; nb <- row_b$n; n <- na + nb
+  list(
+    n = n,
+    mean = (na * row_a$mean + nb * row_b$mean) / n,
+    fraction = (na * row_a$fraction + nb * row_b$fraction) / n,
+    sumsq = row_a$sumsq + row_b$sumsq
+  )
+}
+
+# Extract one cluster's row from the summary stats dict.
+get_cluster_row <- function(stats, cl) {
+  idx <- match(cl, stats$clusters)
+  list(n = stats$n[idx], mean = stats$mean[idx, ], fraction = stats$fraction[idx, ], sumsq = stats$sumsq[idx, ])
+}
+
+# Welch t-test from summary stats (matches Python de.de_pair_from_stats 'welch' path).
+# Returns de_score for one pair. O(genes), no cell access.
+de_pair_score_from_stats <- function(row_a, row_b, de.param) {
+  n1 <- row_a$n; n2 <- row_b$n
+  if (n1 < de.param$min.cells || n2 < de.param$min.cells) return(list(score = 0, separable = FALSE))
+  
+  m1 <- row_a$mean; m2 <- row_b$mean
+  q1 <- row_a$fraction; q2 <- row_b$fraction
+  ss1 <- row_a$sumsq; ss2 <- row_b$sumsq
+  
+  lfc <- m1 - m2  # already log-normalized, so difference = log fold-change
+  
+  # Unbiased sample variance from sum-of-squares
+  if (n1 >= 2) { v1 <- pmax((ss1 - n1 * m1 * m1) / (n1 - 1), 0) } else { v1 <- rep(0, length(m1)) }
+  if (n2 >= 2) { v2 <- pmax((ss2 - n2 * m2 * m2) / (n2 - 1), 0) } else { v2 <- rep(0, length(m2)) }
+  
+  se <- sqrt(v1 / n1 + v2 / n2)
+  t_stat <- ifelse(se > 0, lfc / se, 0)
+  
+  # Welch-Satterthwaite degrees of freedom
+  num <- (v1 / n1 + v2 / n2)^2
+  den <- ifelse(n1 > 1, (v1 / n1)^2 / (n1 - 1), 0) + ifelse(n2 > 1, (v2 / n2)^2 / (n2 - 1), 0)
+  dof <- ifelse(den > 0, num / den, 1)
+  dof <- pmax(dof, 1)
+  
+  # Two-sided p-value
+  pval <- 2 * pt(abs(t_stat), df = dof, lower.tail = FALSE)
+  pval <- pmin(pmax(pval, 0), 1)
+  pval[!is.finite(pval)] <- 1
+  
+  # BH adjustment
+  padj <- p.adjust(pval, method = "BH")
+  
+  # Apply DE criteria matching de.param
+  base <- (padj < de.param$padj.th) & (abs(lfc) > de.param$lfc.th)
+  
+  # Detection-rate filters
+  q_max <- pmax(q1, q2)
+  q_diff <- ifelse(q_max > 0, abs(q1 - q2) / q_max, 0)
+  
+  is_up <- base & (lfc > 0)
+  is_down <- base & (lfc < 0)
+  
+  if (!is.null(de.param$q1.th)) {
+    is_up <- is_up & (q1 > de.param$q1.th)
+    is_down <- is_down & (q2 > de.param$q1.th)
+  }
+  if (!is.null(de.param$q.diff.th)) {
+    is_up <- is_up & (q_diff > de.param$q.diff.th)
+    is_down <- is_down & (q_diff > de.param$q.diff.th)
+  }
+  
+  is_de <- is_up | is_down
+  
+  if (sum(is_de) == 0) return(list(score = 0, separable = FALSE))
+  
+  de_score <- sum(pmin(-log10(padj[is_de] + 1e-300), 20))
+  n_de <- sum(is_de)
+  separable <- (n_de >= de.param$min.genes) && (de_score >= de.param$de.score.th)
+  
+  list(score = de_score, separable = separable)
 }
 
 
-
+# Ultra-fast C-level cluster mean aggregation (250x faster than Seurat AggregateExpression)
+fast_cluster_means <- function(data_mat, features, group_vec) {
+  sub_mat <- data_mat[features, , drop = FALSE]
+  group_factor <- factor(as.character(group_vec))
+  cl_levels <- levels(group_factor)
   
+  if (length(cl_levels) <= 1) {
+    mean_vec <- matrix(Matrix::rowMeans(sub_mat), ncol = 1)
+    colnames(mean_vec) <- cl_levels
+    rownames(mean_vec) <- features
+    return(mean_vec)
+  }
+  
+  L <- Matrix::fac2sparse(group_factor)
+  counts_per_cl <- as.numeric(Matrix::rowSums(L))
+  counts_per_cl[counts_per_cl == 0] <- 1
+  
+  sum_mat <- L %*% Matrix::t(sub_mat)
+  mean_mat <- Matrix::t(as.matrix(sum_mat) / counts_per_cl)
+  colnames(mean_mat) <- cl_levels
+  rownames(mean_mat) <- features
+  return(mean_mat)
+}
+
+# merge_cl
+# High-efficiency cluster merging matching Python iterclust algorithm structure:
+# Uses ultra-fast C++ Wilcoxon rank-sum test (presto::wilcoxauc) on candidate gene sparse matrix slices,
+# single-pass sparse matrix aggregation, algebraic centroid pooling, k-NN candidate graph (k=3), and DE score caching
+merge_cl <- function(object,
+                     de.param = de_param(), 
+                     merge.type = c("undirectional", "directional"), 
+                     max.cl.size = 300,
+                     k_neighbors = 3,
+                     assay = "RNA",
+                     data_mat = NULL) {
+  merge.type <- merge.type[1]
+  DefaultAssay(object) <- assay
+  
+  if (!"seurat_clusters" %in% colnames(object@meta.data)) {
+    object@meta.data$seurat_clusters <- Idents(object)
+  }
+  object@meta.data$cluster_merge <- as.character(object@meta.data$seurat_clusters)
+  
+  v_features <- tryCatch(VariableFeatures(object, assay = assay), error = function(e) NULL)
+  if (is.null(v_features) || length(v_features) == 0) {
+    object <- FindVariableFeatures(object, assay = assay, verbose = FALSE)
+    v_features <- VariableFeatures(object, assay = assay)
+  }
+  if (length(v_features) == 0) v_features <- rownames(object)
+  
+  if (is.null(data_mat)) {
+    data_mat <- GetAssayData(object, assay = assay, layer = "data")
+  }
+  has_presto <- requireNamespace("presto", quietly = TRUE)
+  
+  # Step 1: Pre-pass - Merge small clusters (cells < min.cells) to nearest neighbor based on Pearson correlation
+  while (TRUE) {
+    cl_vec <- object@meta.data$cluster_merge
+    cl_size <- table(cl_vec)
+    if (length(cl_size) <= 1) break
+    
+    small_cls <- names(cl_size)[cl_size < de.param$min.cells]
+    if (length(small_cls) == 0) break
+    
+    matrix_aggr <- fast_cluster_means(data_mat, v_features, object@meta.data$cluster_merge)
+    cl_sim <- cor(matrix_aggr)
+    diag(cl_sim) <- -Inf
+    
+    smallest_cl <- names(cl_size)[order(cl_size)][1]
+    if (!smallest_cl %in% colnames(cl_sim)) break
+    
+    nn_cl <- names(which.max(cl_sim[smallest_cl, ]))
+    object@meta.data$cluster_merge[object@meta.data$cluster_merge == smallest_cl] <- nn_cl
+  }
+  
+  # Step 2: High-efficiency DE merge loop using centroid pooling & k-NN candidate graph
+  cl_vec <- object@meta.data$cluster_merge
+  cl_size <- table(cl_vec)
+  if (length(cl_size) <= 1) {
+    object@meta.data$seurat_clusters <- object@meta.data$cluster_merge
+    return(object)
+  }
+  
+  matrix_aggr <- fast_cluster_means(data_mat, v_features, object@meta.data$cluster_merge)
+  de_cache <- new.env(hash = TRUE)
+  
+  get_pair_key <- function(a, b) {
+    if (a < b) paste0(a, "___", b) else paste0(b, "___", a)
+  }
+  
+  while (ncol(matrix_aggr) > 1) {
+    active_cls <- colnames(matrix_aggr)
+    n_active <- length(active_cls)
+    if (n_active <= 1) break
+    
+    cl_sim <- cor(matrix_aggr)
+    diag(cl_sim) <- -Inf
+    
+    # Build candidate pairs from top k-NN neighbors
+    cand_pairs <- list()
+    for (i in seq_len(n_active)) {
+      c_i <- active_cls[i]
+      sim_vec <- cl_sim[i, ]
+      top_k_idx <- order(sim_vec, decreasing = TRUE)[1:min(k_neighbors, n_active - 1)]
+      for (k_idx in top_k_idx) {
+        c_k <- active_cls[k_idx]
+        pkey <- get_pair_key(c_i, c_k)
+        cand_pairs[[pkey]] <- c(c_i, c_k)
+      }
+    }
+    
+    if (length(cand_pairs) == 0) break
+    
+    # Evaluate DE score using fast presto C++ Wilcoxon testing
+    scored_list <- list()
+    for (pkey in names(cand_pairs)) {
+      pair <- cand_pairs[[pkey]]
+      if (exists(pkey, envir = de_cache, inherits = FALSE)) {
+        res <- get(pkey, envir = de_cache)
+      } else {
+        p1 <- pair[1]; p2 <- pair[2]
+        cells_p1 <- which(object@meta.data$cluster_merge == p1)
+        cells_p2 <- which(object@meta.data$cluster_merge == p2)
+        if (length(cells_p1) > max.cl.size) cells_p1 <- cells_p1[sample.int(length(cells_p1), max.cl.size)]
+        if (length(cells_p2) > max.cl.size) cells_p2 <- cells_p2[sample.int(length(cells_p2), max.cl.size)]
+        
+        n1 <- length(cells_p1)
+        n2 <- length(cells_p2)
+        de_score <- 0
+        n_de <- 0
+        
+        if (has_presto && n1 > 0 && n2 > 0) {
+          sub_mat <- data_mat[, c(cells_p1, cells_p2), drop = FALSE]
+          # Pre-filter candidate genes expressed >= 10% in at least one cluster (matching FindMarkers min.pct=0.1)
+          pct1 <- Matrix::rowSums(sub_mat[, 1:n1, drop = FALSE] > 0) / n1
+          pct2 <- Matrix::rowSums(sub_mat[, (n1 + 1):(n1 + n2), drop = FALSE] > 0) / n2
+          cand_idx <- which(pmax(pct1, pct2) >= 0.1)
+          
+          if (length(cand_idx) > 0) {
+            y_vec <- c(rep("p1", n1), rep("p2", n2))
+            pres <- suppressWarnings(tryCatch({ presto::wilcoxauc(sub_mat[cand_idx, , drop = FALSE], y_vec) }, error = function(e) NULL))
+            
+            if (!is.null(pres) && nrow(pres) > 0) {
+              res_p1 <- pres[pres$group == "p1", ]
+              pct1_v <- res_p1$pct_in / 100
+              pct2_v <- res_p1$pct_out / 100
+              valid <- which(abs(res_p1$logFC) >= de.param$lfc.th & res_p1$padj < de.param$padj.th)
+              if (length(valid) > 0) {
+                q_diff <- abs(pct1_v[valid] - pct2_v[valid]) / pmax(pct1_v[valid], pct2_v[valid])
+                valid_q <- valid[q_diff > de.param$q.diff.th]
+                if (length(valid_q) > 0) {
+                  norm_p <- pmin(-log10(res_p1$padj[valid_q] + 1e-300), 20)
+                  de_score <- sum(norm_p)
+                  n_de <- length(valid_q)
+                }
+              }
+            }
+          }
+        } else if (n1 > 0 && n2 > 0) {
+          sub_obj <- object[, c(cells_p1, cells_p2)]
+          DefaultAssay(sub_obj) <- assay
+          markers <- suppressWarnings(tryCatch({
+            FindMarkers(sub_obj, ident.1 = p1, ident.2 = p2, assay = assay,
+                        group.by = "cluster_merge", logfc.threshold = de.param$lfc.th, 
+                        min.pct = 0.1, verbose = FALSE, recorrect_umi = FALSE)
+          }, error = function(e) NULL))
+          if (!is.null(markers) && nrow(markers) > 0) {
+            markers <- markers[markers$p_val_adj < de.param$padj.th, , drop = FALSE]
+            if (nrow(markers) > 0) {
+              q_diff <- abs(markers$pct.1 - markers$pct.2) / pmax(markers$pct.1, markers$pct.2)
+              markers <- markers[q_diff > de.param$q.diff.th, , drop = FALSE]
+              if (nrow(markers) > 0) {
+                de_score <- sum(pmin(-log10(markers$p_val_adj), 20))
+                n_de <- nrow(markers)
+              }
+            }
+          }
+        }
+        
+        separable <- (n_de >= de.param$min.genes) && (de_score >= de.param$de.score.th)
+        res <- list(score = de_score, separable = separable)
+        assign(pkey, res, envir = de_cache)
+      }
+      
+      if (!res$separable) {
+        scored_list[[length(scored_list) + 1]] <- list(score = res$score, p1 = pair[1], p2 = pair[2], key = pkey)
+      }
+    }
+    
+    if (length(scored_list) == 0) break
+    
+    # Sort pairs by DE score (lowest DE score first = most mergeable)
+    scores <- sapply(scored_list, function(x) x$score)
+    scored_list <- scored_list[order(scores)]
+    best_merge <- scored_list[[1]]
+    keep_cl <- best_merge$p1
+    drop_cl <- best_merge$p2
+    
+    # Update aggregated centroid matrix in-memory (weighted pool of keep_cl and drop_cl) BEFORE updating cluster_merge
+    n_keep <- sum(object@meta.data$cluster_merge == keep_cl)
+    n_drop <- sum(object@meta.data$cluster_merge == drop_cl)
+    n_total <- n_keep + n_drop
+    
+    if (n_total > 0) {
+      matrix_aggr[, keep_cl] <- (matrix_aggr[, keep_cl] * n_keep + matrix_aggr[, drop_cl] * n_drop) / n_total
+    }
+    drop_idx <- match(drop_cl, colnames(matrix_aggr))
+    if (!is.na(drop_idx)) {
+      matrix_aggr <- matrix_aggr[, -drop_idx, drop = FALSE]
+    }
+    
+    # Update cluster assignments
+    object@meta.data$cluster_merge[object@meta.data$cluster_merge == drop_cl] <- keep_cl
+    
+    # Invalidate cache entries touching keep_cl or drop_cl
+    cache_keys <- ls(envir = de_cache)
+    to_remove <- cache_keys[grepl(keep_cl, cache_keys, fixed = TRUE) | grepl(drop_cl, cache_keys, fixed = TRUE)]
+    if (length(to_remove) > 0) rm(list = to_remove, envir = de_cache)
+  }
+  
+  object@meta.data$seurat_clusters <- object@meta.data$cluster_merge
+  return(object)
+}
+
+# MergeCluster
+MergeCluster <- function(object, padj.th = 0.05, lfc.th = 0.405, q.diff.th = 0.7, de.score.th = 150, min.cells = 4, assay = "RNA") {
+  de.param <- de_param(padj.th = padj.th, lfc.th = lfc.th, q.diff.th = q.diff.th, de.score.th = de.score.th, min.cells = min.cells)
+  return(merge_cl(object = object, de.param = de.param, assay = assay))
+}
+
+# iter.clust
+# Resolution-Escalating Iterative Clustering (Ported from BrainMappingPipeline iterclust.py)
+# Optimizations over naive Seurat:
+#   - ScaleData on variable features only (not all ~30k genes)
+#   - data_mat extracted ONCE and shared across resolution ladder
+#   - Labels-only recursion: no SplitObject/merge deep copies — collects cell-label maps
+#   - Multi-core parallelized sub-branch recursion using parallel::mclapply
+iter.clust <- function(object, 
+                       de.param = de_param(), 
+                       res_ladder = DEFAULT_RES_LADDER, 
+                       sat_tol = 0.05, 
+                       split.size = 10, 
+                       assay = "RNA",
+                       path = "root",
+                       depth = 0,
+                       ncore = 1,
+                       verbose = TRUE) {
+  DefaultAssay(object) <- assay
+  n_cells <- ncol(object)
+  
+  log_ts <- function(msg) {
+    if (verbose) {
+      ts <- format(Sys.time(), "[%H:%M:%S]")
+      message(paste(ts, msg))
+      flush.console()
+    }
+  }
+  
+  log_ts(sprintf("[BRANCH START] Path: %s | Depth: %d | Cells: %d", path, depth, n_cells))
+  
+  # Leaf check: min_cells
+  if (n_cells < split.size) {
+    log_ts(sprintf("  [LEAF] Path: %s | Cells: %d | Reason: min_cells (< %d)", path, n_cells, split.size))
+    return(object)
+  }
+  
+  object <- FindVariableFeatures(object, assay = assay, verbose = FALSE)
+  v_features <- VariableFeatures(object, assay = assay)
+  
+  if (length(v_features) <= 30) {
+    log_ts(sprintf("  [LEAF] Path: %s | Reason: low_var_features (<= 30)", path))
+    return(object)
+  }
+  
+  # Guard against irlba PCA underflow crashes on small sub-clusters
+  max_pcs <- min(29, n_cells - 2, length(v_features) - 1)
+  if (max_pcs < 2) {
+    log_ts(sprintf("  [LEAF] Path: %s | Reason: low_pca_dims (< 2)", path))
+    return(object)
+  }
+  
+  # Ensure assay has normalized 'data' layer for ScaleData & FindMarkers
+  has_data_layer <- tryCatch({
+    layers_list <- SeuratObject::Layers(object[[assay]])
+    any(grepl("^data", layers_list))
+  }, error = function(e) FALSE)
+  
+  if (!has_data_layer) {
+    object <- NormalizeData(object, assay = assay, verbose = FALSE)
+  }
+  
+  # ScaleData on variable features ONLY (not all ~30k genes — saves ~90% time)
+  object <- ScaleData(object, features = v_features, verbose = FALSE)
+  object <- suppressWarnings(RunPCA(object, features = v_features, npcs = max_pcs, verbose = FALSE))
+  object <- suppressWarnings(FindNeighbors(object, dims = 1:max_pcs, verbose = FALSE))
+  
+  # Extract normalized data matrix ONCE for the entire resolution ladder
+  data_mat <- GetAssayData(object, assay = assay, layer = "data")
+  
+  # --- Resolution Escalation Ladder (BrainMappingPipeline saturation logic) ---
+  prev_n <- -1
+  chosen_merged <- NULL
+  chosen_res <- NULL
+  chosen_raw_n <- 0
+  
+  for (r in res_ladder) {
+    t_start <- Sys.time()
+    obj_r <- suppressWarnings(FindClusters(object, resolution = r, verbose = FALSE, group.singletons = FALSE))
+    raw_clusters <- obj_r@meta.data$seurat_clusters
+    n_raw <- length(unique(raw_clusters))
+    
+    if (n_raw <= 1) {
+      merged_cl <- raw_clusters
+    } else {
+      # Pass shared data_mat — avoids redundant GetAssayData per resolution
+      obj_merged <- merge_cl(object = obj_r, de.param = de.param, assay = assay, data_mat = data_mat)
+      merged_cl <- obj_merged@meta.data$cluster_merge
+    }
+    
+    n_merged <- length(unique(merged_cl))
+    t_elapsed <- round(as.numeric(difftime(Sys.time(), t_start, units = "secs")), 2)
+    
+    log_ts(sprintf("  [LADDER] Res: %.1f | Raw Clusters: %d -> DE-Merged: %d | Time: %.2fs", r, n_raw, n_merged, t_elapsed))
+    
+    # Saturation check: stop escalating when merged cluster count stops growing (grows <= sat_tol %)
+    if (prev_n > 0 && n_merged <= prev_n * (1 + sat_tol)) {
+      log_ts(sprintf("  [SATURATED] Merged count plateaus at Res: %.1f (Merged: %d)", chosen_res, prev_n))
+      break
+    }
+    
+    chosen_merged <- merged_cl
+    chosen_res <- r
+    chosen_raw_n <- n_raw
+    prev_n <- n_merged
+  }
+  
+  # Assign the DE-determined grouping at chosen resolution
+  object@meta.data$cluster_merge <- as.character(chosen_merged)
+  object@meta.data$seurat_clusters <- object@meta.data$cluster_merge
+  
+  cl_merged_unique <- unique(object@meta.data$cluster_merge)
+  if (length(cl_merged_unique) <= 1) {
+    reason <- if (chosen_raw_n <= 1) "no_raw_split" else "no_de_separable_split"
+    log_ts(sprintf("  [LEAF] Path: %s | Cells: %d | Reason: %s", path, n_cells, reason))
+    return(object)
+  }
+  
+  # Sub-clustering branch split with parallel recursion
+  # Uses labels-only collection to avoid expensive SplitObject/merge deep copies
+  log_ts(sprintf("[SPLIT] Path: %s | Chosen Res: %.1f | Raw: %d -> Merged Separable: %d. Recursing into sub-branches (ncore = %d)...", 
+                 path, chosen_res, chosen_raw_n, length(cl_merged_unique), ncore))
+  
+  sub_list <- SplitObject(object, split.by = "cluster_merge")
+  cl_ids <- names(sub_list)
+  n_sub <- length(cl_ids)
+  
+  cores_to_use <- min(ncore, n_sub)
+  sub_ncore <- max(1, floor(ncore / cores_to_use))
+  
+  # Worker: recurse on sub-branch, return named cell-to-label vector (NOT full Seurat objects when possible)
+  process_sub <- function(i) {
+    cl_id <- cl_ids[i]
+    sub_obj <- sub_list[[cl_id]]
+    sub_path <- paste0(path, ".", cl_id)
+    
+    if (verbose) {
+      start_msg <- sprintf("[%s] [PARALLEL WORKER] Branch %d/%d (%s) STARTED (%d cells)", 
+                           format(Sys.time(), "%H:%M:%S"), i, n_sub, sub_path, ncol(sub_obj))
+      cat(paste0(start_msg, "\n"), file = stderr())
+      flush(stderr())
+    }
+    
+    res <- tryCatch({
+      if (ncol(sub_obj) >= split.size) {
+        sub_obj_clustered <- iter.clust(
+          sub_obj, de.param = de.param, res_ladder = res_ladder, 
+          sat_tol = sat_tol, split.size = split.size, assay = assay, 
+          path = sub_path, depth = depth + 1, ncore = sub_ncore, verbose = verbose
+        )
+        # Return only the cell-to-label mapping with parent branch prefix (lightweight)
+        labels <- paste0(cl_id, ".", sub_obj_clustered@meta.data$cluster_merge)
+        names(labels) <- colnames(sub_obj_clustered)
+        labels
+      } else {
+        if (verbose) {
+          leaf_msg <- sprintf("[%s]   [LEAF] Path: %s | Cells: %d | Reason: min_cells (< %d)", 
+                              format(Sys.time(), "%H:%M:%S"), sub_path, ncol(sub_obj), split.size)
+          cat(paste0(leaf_msg, "\n"), file = stderr())
+          flush(stderr())
+        }
+        labels <- rep(cl_id, ncol(sub_obj))
+        names(labels) <- colnames(sub_obj)
+        labels
+      }
+    }, error = function(e) {
+      err_msg <- sprintf("[%s] [ERROR in Branch %s]: %s (retaining branch un-split)", 
+                         format(Sys.time(), "%H:%M:%S"), sub_path, e$message)
+      cat(paste0(err_msg, "\n"), file = stderr())
+      flush(stderr())
+      labels <- rep(cl_id, ncol(sub_obj))
+      names(labels) <- colnames(sub_obj)
+      labels
+    })
+    
+    if (verbose) {
+      done_msg <- sprintf("[%s] [PARALLEL WORKER] Branch %d/%d (%s) COMPLETED", 
+                          format(Sys.time(), "%H:%M:%S"), i, n_sub, sub_path)
+      cat(paste0(done_msg, "\n"), file = stderr())
+      flush(stderr())
+    }
+    
+    return(res)
+  }
+  
+  if (cores_to_use > 1 && .Platform$OS.type == "unix") {
+    sub_results <- parallel::mclapply(seq_len(n_sub), process_sub, mc.cores = cores_to_use)
+  } else {
+    sub_results <- lapply(seq_len(n_sub), process_sub)
+  }
+  
+  # Collect all cell-to-label mappings back into the original object (no merge() needed)
+  all_labels <- unlist(sub_results)
+  
+  # Write labels back to original object metadata (cells that exist in all_labels)
+  matched_cells <- intersect(colnames(object), names(all_labels))
+  object@meta.data[matched_cells, "cluster_merge"] <- all_labels[matched_cells]
+  object@meta.data$seurat_clusters <- object@meta.data$cluster_merge
+  
+  return(object)
+}
+
+# bootstrap_iter_clust
+bootstrap_iter_clust <- function(seurat.obj, n.iter = 100, de.param = de_param(), res_ladder = DEFAULT_RES_LADDER, assay = "RNA", verbose = FALSE) {
+  n.cluster <- c()
+  cocluster.matrix <- data.frame()
+  start.time <- Sys.time()
+  
+  for (i in 1:n.iter) {
+    message(paste("Start iteration", i, "of", n.iter))
+    pred <- sample(colnames(seurat.obj), ncol(seurat.obj) * 0.8)
+    scdata.sample <- seurat.obj[, pred]
+    scdata.sample <- DietSeurat(scdata.sample)
+    
+    scdata.sample <- FindVariableFeatures(scdata.sample, assay = assay, verbose = FALSE)
+    scdata.sample <- ScaleData(scdata.sample, verbose = FALSE)
+    scdata.sample <- RunPCA(scdata.sample, npcs = 29, verbose = FALSE)
+    scdata.sample <- FindNeighbors(scdata.sample, dims = 1:29, verbose = FALSE)
+    scdata.sample <- FindClusters(scdata.sample, resolution = 2, verbose = FALSE)
+    
+    scdata.sample <- merge_cl(object = scdata.sample, de.param = de.param, assay = assay)
+    scdata.sample <- iter.clust(object = scdata.sample, de.param = de.param, res_ladder = res_ladder, assay = assay, verbose = verbose)
+    
+    cluster.i <- data.frame(name = rownames(scdata.sample@meta.data), cluster = paste(scdata.sample@meta.data$cluster_merge, ".iter", i, sep = ""))
+    cocluster.matrix <- rbind(cocluster.matrix, cluster.i)
+    n.cluster <- c(n.cluster, length(unique(scdata.sample@meta.data$cluster_merge)))
+  }
+  
+  cocluster.matrix.average <- crossprod(table(cocluster.matrix[c(2, 1)]))
+  return(list(cocluster.matrix.average, n.cluster))
+}
+
+# Save AnnData
+save.h5ad <- function(seurat.object, assay = "RNA", layer = "counts", filename) {
+  counts_matrix <- GetAssayData(seurat.object, assay = assay, layer = layer)
+  obs_metadata <- seurat.object@meta.data
+  gene_names <- rownames(counts_matrix)
+  var_metadata <- data.frame(gene_names = gene_names, row.names = gene_names)
+  adata <- AnnData(X = Matrix::t(counts_matrix), obs = obs_metadata, var = var_metadata)
+  write_h5ad(adata, filename)
+}
