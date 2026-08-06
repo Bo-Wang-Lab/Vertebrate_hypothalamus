@@ -2,3 +2,18 @@
 __pycache__/
 *.pyc
 .DS_Store
+
+# Large genomic / single-cell data files (exceed GitHub's 100 MB limit)
+*.fa
+*.fasta
+*.fa.gz
+*.fasta.gz
+*.gtf
+*.gff
+*.gff3
+*.bam
+*.sam
+*.h5ad
+*.loom
+*.rds
+*.mtx
