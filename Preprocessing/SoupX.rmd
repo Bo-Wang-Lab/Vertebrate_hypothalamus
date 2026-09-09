@@ -15,16 +15,16 @@ library(Seurat)
 
 ```{r}
 #Input raw STARSolo output
-Run_name = "DR"
-MO_unfiltered <- ReadMtx( mtx= paste("../../SoupX/DR/DanioRerio1/Gene/raw/matrix.mtx.gz",sep=""),
-cells = paste("../../SoupX/DR/DanioRerio1/Gene/raw/barcodes.tsv.gz",sep=""),
-features = paste("../../SoupX/DR/DanioRerio1/Gene/raw/features.tsv.gz",sep=""),
+Run_name = "MO"
+MO_unfiltered <- ReadMtx( mtx= paste("../../SoupX/MO/Run12_sample11_STARSolo_outSolo.out/GeneFull/raw/matrix.mtx.gz",sep=""),
+cells = paste("../../SoupX/MO/Run12_sample11_STARSolo_outSolo.out/GeneFull/raw/barcodes.tsv.gz",sep=""),
+features = paste("../../SoupX/MO/Run12_sample11_STARSolo_outSolo.out/GeneFull/raw/features.tsv.gz",sep=""),
                  feature.column=1, mtx.transpose=F)
 ```
 
 ```{r}
 #Input filtered counts
-MO_filtered <- read.csv(file = paste('../../SoupX/DR/preprocessed_DanioRerio1.h5ad_filtered.csv',sep=""),row.names=1)
+MO_filtered <- read.csv(file = paste('../../SoupX/MO/Old_filtered_clusters/Run12_sample11_filtered.csv',sep=""),row.names=1)
 MO_filtered_matrix = as.matrix(MO_filtered)
 MO_filtered_CSC <- as((MO_filtered_matrix), "dgCMatrix")
 ```
@@ -39,7 +39,7 @@ MO_sc1 = SoupChannel(MO_unfiltered_gene,MO_filtered_CSC)
 
 ```{r}
 #Input leiden clusters from SAM
-MO_clusters <- read.csv(file = paste('../../SoupX/DR/preprocessed_DanioRerio1.h5ad_leiden_clusters.csv',sep =""),row.names=1)
+MO_clusters <- read.csv(file = paste('../../SoupX/MO/Old_filtered_clusters/Run12_sample11_leiden_clusters.csv',sep =""),row.names=1)
 ```
 
 ```{r}
@@ -47,10 +47,10 @@ MO_sc1_clus = setClusters(MO_sc1, setNames(MO_clusters$leiden_clusters, rownames
 ```
 
 ```{r}
-MO_sc1_clus <- autoEstCont(MO_sc1_clus, soupQuantile = .2)
+MO_sc1_clus <- autoEstCont(MO_sc1_clus, soupQuantile = .7)
 ```
 ```{r}
-MO_sc1_clus = setContaminationFraction(MO_sc1_clus, 0.015)
+MO_sc1_clus = setContaminationFraction(MO_sc1_clus, 0.307)
 ```
 
 ```{r}
@@ -115,6 +115,6 @@ write_dgCMatrix_csv <- function(mat,
 
 ```{r}
 #Output name
-write_dgCMatrix_csv(MO_out1,filename = paste("",sep = ""))
+write_dgCMatrix_csv(MO_out1,filename = paste("../../SoupX/Run12_sample11_v2_MO_soupcorr_validation_08282026.csv",sep = ""))
 ```
 
