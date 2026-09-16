@@ -1,0 +1,1518 @@
+---
+title: "cell type analysis"
+output: html_notebook: default
+
+  html_document: default
+---
+
+# Preparation
+
+## File setup
+
+```{r}
+# Set the SCRNA_ROOT environment variable to the directory that holds the sibling
+# folders CelltypeAnalysis/, SAMapH5ad/, Rsource/, SpatialMappingofAlignedCelltypes/.
+# Default = this notebook's parent directory (matches the repo layout when knitting),
+# so no machine-specific absolute path is stored in the file.
+project.root   <- Sys.getenv("SCRNA_ROOT", unset = normalizePath(".."))
+work.folder    <- file.path(project.root, "14_NeurotransmittertypeAnalysis/", "")               # trailing "" -> "/"
+data.folder    <- file.path(project.root, "Prateek_output/", "")
+source.folder  <- file.path(project.root, "Rsource/", "")
+```
+
+## Install specialty libraries
+Installation only run at the first time intalled packages: limma: DE analysis scrattch.hicat: Allen institute hicat for cell type clustering Rphenograph: dependency for hicat for clustering. WGCNA: weighted gene network analysis, not used in most cases as it is not scalable for large data qlcMatrix: matrix operation
+```{r}
+#if (!require("BiocManager", quietly = TRUE))
+#    install.packages("BiocManager")
+#BiocManager::install("limma")
+#devtools::install_github("JinmiaoChenLab/Rphenograph")
+#BiocManager::install("WGCNA")
+#devtools::install_github("cysouw/qlcMatrix")
+#devtools::install_github("AllenInstitute/scrattch.hicat")
+```
+
+## Load packages
+
+```{r, echo=T, results='hide'}
+suppressPackageStartupMessages({
+  #library(parallel) # parallelization
+  library(dplyr) # %in%
+  library(Matrix) #matrix operation
+  library(Seurat) # Seurat single cell tool kit.
+  library(ggplot2) # ggplot
+  library(RColorBrewer) #for making color palette
+  library(pheatmap)#generate heatmap
+  library(scCustomize)
+  library(harmony)
+  #library(future)
+  library(ggExtra)
+  library(qs2)
+  library(Polychrome)
+})
+
+#options(future.globals.maxSize = 50000 * 1024^2) # need to set for seurat clustering when large data is used
+#plan("multisession", workers = 40)
+
+```
+
+## Define functions
+
+```{r}
+# hicat.R and decontx.R are not sourced: none of their functions are used in
+# this notebook (their libraries are loaded above anyway).
+source(paste0(source.folder,"IO.R"))
+source(paste0(source.folder,"CelltypeCharacterization.R"))
+```
+
+
+# Import data
+
+
+
+
+## Import Allen insitute hypothalamus data
+```{r}
+metadata.AI <- read.csv(file = paste(data.folder,"../Reference_data/cell_metadata_with_cluster_annotation.csv",sep=""))
+rownames(metadata.AI) <- metadata.AI$cell_label
+qs_save(metadata.AI, file = "metadata.AI_09162026.qs2", nthreads = 24)
+
+ggplot(metadata.AI, aes(x=x, y=y)) +
+  geom_point(size=0.1, color="#A9A9A980")+
+  geom_point(data=metadata.AI, aes(x=x,y=y), size=0.1, color=metadata.AI$subclass_color)+
+  theme_void() + 
+  theme(legend.position = "none") +
+  coord_fixed()
+
+
+```
+
+
+## Import Prairie vole data
+
+```{r}
+# import data to Seurat format
+scdata.MO <- qs_read(paste0(data.folder,"scdata.MO.09102026.qs2"), nthreads = 24)
+# default processing
+scdata.MO <- SeuratProcess(scdata.MO, "key", ncore = 40, run.iterative = FALSE)
+
+qs_save(scdata.MO, file = "scdata.MO_09162026.qs2", nthreads = 24)
+```
+
+
+
+
+## Import Japanese quail data
+```{r}
+# import data to Seurat format
+# import data to Seurat format
+scdata.CJ <- qs_read(paste0(data.folder,"scdata.CJ.09102026.qs2"), nthreads = 24)
+# default processing
+scdata.CJ <- SeuratProcess(scdata.CJ, "key", ncore = 40, run.iterative = FALSE)
+
+qs_save(scdata.CJ, file = "scdata.CJ_09162026.qs2", nthreads = 24)
+```
+
+
+
+
+## Import green anole data
+```{r}
+# import data to Seurat format
+# import data to Seurat format
+scdata.AC <- qs_read(paste0(data.folder,"scdata.AC.09102026.qs2"), nthreads = 24)
+# default processing
+scdata.AC <- SeuratProcess(scdata.AC, "key", ncore = 40, run.iterative = FALSE)
+
+qs_save(scdata.AC, file = "scdata.AC_09162026.qs2", nthreads = 24)
+```
+
+## Import xenopus data
+```{r}
+# import data to Seurat format
+scdata.XT <- qs_read(paste0(data.folder,"scdata.XT.09102026.qs2"), nthreads = 24)
+# default processing
+scdata.XT <- SeuratProcess(scdata.XT, "key", ncore = 40, run.iterative = FALSE)
+
+qs_save(scdata.XT, file = "scdata.XT_09162026.qs2", nthreads = 24)
+```
+
+
+## Import zebrafish data
+```{r}
+# import data to Seurat format
+scdata.DR <- qs_read(paste0(data.folder,"scdata.DR.09102026.qs2"), nthreads = 24)
+# default processing
+scdata.DR <- SeuratProcess(scdata.DR, "key", ncore = 40, run.iterative = FALSE)
+
+qs_save(scdata.DR, file = "scdata.DR_09162026.qs2", nthreads = 24)
+```
+
+
+
+
+
+
+
+
+Neurotransmitter analysis
+
+AI criteria
+
+Glutamatergic (Glut): Slc17a6 (also known as Vglut2), Slc17a7 (Vglut1) or Slc17a8 (Vglut3).
+
+GABAergic (GABA): (Slc32a1 (Vgat) or Slc18a2 (Vmat2)) and (Gad1, Gad2 or Aldh1a1).
+
+Glycinergic (Glyc): Slc6a5.
+
+Cholinergic (Chol): Slc18a3 (Vacht) and Chat.
+
+Dopaminergic (Dopa): (Slc6a3 (Dat) or Slc18a2) and (Th and Ddc).
+
+Serotonergic (Sero): (Slc6a4 (Sert) or Slc18a2) and (Tph2 and Ddc).
+
+Noradrenergic (Nora): (Slc6a2 (Net) or Slc18a2) and Dbh.
+
+Histaminergic (Hist): Slc18a2 and Hdc.
+
+
+
+# Neurotransmitter type annotation
+
+Allen institute criteria
+
+Glutamatergic (Glut): Slc17a6 (also known as Vglut2), Slc17a7 (Vglut1) or Slc17a8 (Vglut3).
+GABAergic (GABA): (Slc32a1 (Vgat) or Slc18a2 (Vmat2)) and (Gad1, Gad2 or Aldh1a1).
+Glycinergic (Glyc): Slc6a5.
+Cholinergic (Chol): Slc18a3 (Vacht) and Chat.
+Dopaminergic (Dopa): (Slc6a3 (Dat) or Slc18a2) and (Th and Ddc).
+Serotonergic (Sero): (Slc6a4 (Sert) or Slc18a2) and (Tph2 and Ddc).
+Noradrenergic (Nora): (Slc6a2 (Net) or Slc18a2) and Dbh.
+Histaminergic (Hist): Slc18a2 and Hdc.
+We used a stringent expression threshold of log2(CPM)>3 for these genes to assign neurotransmitter identity to each cluster.
+
+
+Idents, e.g. "eq_subclass" should be changed to the col name of the equivalent subclass.
+
+## function to calculate per cell type average expression 
+
+This function may generate wrong estimate if cells within one cluster is < 30
+set seed for reproducibility
+```{r}
+NT.marker.threshold <- function(NT.marker, scdata, cluster.label, downsample = 100, seed = 42) {
+      
+      # Set random seed for 100% reproducible downsampling
+      if (!is.null(seed)) {
+        set.seed(seed)
+      }
+      
+      # 1. Explicit Conditional Downsampling Logic
+      meta_labels <- scdata[[cluster.label]][, 1]
+      cell_names <- rownames(scdata@meta.data)
+      
+      if (!is.null(downsample)) {
+        # Loop through each cluster and decide how many cells to keep
+        cells_to_keep <- unlist(lapply(unique(meta_labels), function(cluster) {
+          cluster_cells <- cell_names[meta_labels == cluster]
+          
+          if (length(cluster_cells) <= downsample) {
+            return(cluster_cells) # Keep all cells if below or equal to threshold
+          } else {
+            return(sample(cluster_cells, downsample, replace = FALSE)) # Sample reproducibly
+          }
+        }))
+        
+        # Subset the Seurat object using our explicitly chosen cells
+        scdata.small <- subset(scdata, cells = cells_to_keep)
+      } else {
+        scdata.small <- scdata # If downsample = NULL, use ALL cells (exact deterministic result)
+      }
+      
+      # 2. Pull RAW counts using Seurat v5 syntax ('layer' instead of 'slot')
+      counts_matrix <- GetAssayData(scdata.small, assay = "RNA", layer = "counts")
+      
+      if (!NT.marker %in% rownames(counts_matrix)) {
+        stop(paste("Error: The gene", NT.marker, "was not found in the RNA assay."))
+      }
+      
+      labels <- as.character(unique(scdata.small[[cluster.label]][, 1]))
+      
+      marker.exp <- data.frame(
+        celltype = labels, 
+        mean_lnCPM = numeric(length(labels)), 
+        pct.expr = numeric(length(labels))
+      )
+      rownames(marker.exp) <- labels
+      
+      # 3. Loop through clusters to calculate metrics
+      for (i in seq_along(labels)) {
+        current_cluster <- labels[i]
+        cell_ids <- rownames(scdata.small@meta.data)[scdata.small[[cluster.label]][, 1] == current_cluster]
+        
+        # Get raw gene counts for these specific cells
+        gene_counts <- counts_matrix[NT.marker, cell_ids]
+        
+        # Get total UMIs (library size) for these specific cells
+        total_counts <- scdata.small$nCount_RNA[cell_ids]
+        
+        # Calculate exact CPM: (gene counts / total counts) * 1,000,000
+        cpm_values <- (gene_counts / total_counts) * 1e6
+        
+        # Calculate ln(CPM + 1) using R's default natural log function
+        ln_cpm_values <- log(cpm_values + 1)
+        
+        # Calculate and store metrics
+        marker.exp$mean_lnCPM[i] <- mean(ln_cpm_values)
+        marker.exp$pct.expr[i] <- (sum(gene_counts > 0) / length(gene_counts)) * 100
+      }
+       
+      return(marker.exp)
+    }
+
+```
+
+
+## Annotate Xenopus tropicalis NT types
+
+
+```{r}
+
+#initiate a table to label NT types
+Idents(scdata.XT)<-"eq_subclass"
+plot.chart <- DotPlot(scdata.XT,c("slc32a1","slc17a6","chat","th","tph2"),cols = c("lightgrey","darkred"))
+XT.nt <- data.frame(scdata.XT@meta.data[,c("eq_subclass")])
+colnames(XT.nt)<-"eq_subclass"
+XT.nt <- XT.nt[duplicated(XT.nt$eq_subclass)==F, ]
+XT.nt <- data.frame(subclass=XT.nt, Glut=rep(0, length(XT.nt)), Gaba=rep(0, length(XT.nt)), Dopa=rep(0, length(XT.nt)), Chol=rep(0, length(XT.nt)), Sert=rep(0, length(XT.nt)), Nora=rep(0, length(XT.nt)), Gly=rep(0, length(XT.nt)), Hist=rep(0, length(XT.nt)), Neurotransmitter=rep(0, length(XT.nt)))
+
+
+
+#find an arbituary threshold for neurotransmitter markers.
+
+
+
+
+#Dopaminergic
+#ddc not expressed.
+plot.dopa.xt <- DotPlot(scdata.XT,c("slc6a3","SLC18A2","th"),cols = c("lightgrey","darkred"))+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1, size = 5), axis.text.y = element_text(size = 5))
+th.exp <- NT.marker.threshold("th", scdata.XT, cluster.label="eq_subclass")
+slc18a2.exp <- NT.marker.threshold("SLC18A2", scdata.XT, "eq_subclass")
+dat.exp <- NT.marker.threshold("slc6a3", scdata.XT, "eq_subclass")
+
+slc18a2 <- slc18a2.exp[slc18a2.exp[,2]>1.5,1]
+dat <- dat.exp[dat.exp[,2]>1,1]
+th <- th.exp[th.exp[,2]>2,1]
+
+dopa <- intersect(union(slc18a2.exp[slc18a2.exp[,2]>1.5,1], dat.exp[dat.exp[,2]>1,1]), th.exp[th.exp[,2]>2,1])
+#dopa thresold 
+XT.nt$Dopa[XT.nt$subclass %in% dopa]<-1
+
+#Gabaergic
+#gad1 has 2 paralogs
+plot.gaba.xt <-DotPlot(scdata.XT,c("slc32a1","SLC18A2","gad1.1", "gad1.2","gad2","aldh1a1"),cols = c("lightgrey","darkred"))+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1, size = 5), axis.text.y = element_text(size = 5))
+DotPlot(scdata.XT,c("gad1.2"),cols = c("lightgrey","darkred"), assay = "RNA")+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+DotPlot(scdata.XT,c("aldh1a1"),cols = c("lightgrey","darkred"), assay = "RNA")+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+slc32a1.exp <- NT.marker.threshold("slc32a1", scdata.XT, "eq_subclass")
+gad1.1.exp <- NT.marker.threshold("gad1.1", scdata.XT, "eq_subclass")
+gad1.2.exp <- NT.marker.threshold("gad1.2", scdata.XT, "eq_subclass")
+gad2.exp <- NT.marker.threshold("gad2", scdata.XT, "eq_subclass")
+aldh1a1.exp <- NT.marker.threshold("aldh1a1", scdata.XT, "eq_subclass")
+slc17a6.exp <- NT.marker.threshold("slc17a6", scdata.XT, "eq_subclass")
+
+gaba.all.exp<-data.frame(celltype=slc32a1.exp$celltype, slc32a1=slc32a1.exp$mean_lnCPM, gad1.1=gad1.1.exp$mean_lnCPM, gad1.2=gad1.2.exp$mean_lnCPM, gad2=gad2.exp$mean_lnCPM, slc17a6=slc17a6.exp$mean_lnCPM)
+# Save the scatter plot in a variable
+p1 <- ggplot(gaba.all.exp, aes(x = slc17a6, y = slc32a1)) +
+  geom_point()
+# Plot the scatter plot with marginal histograms
+ggMarginal(p1, type = "histogram")
+
+slc32a1 <- slc32a1.exp[slc32a1.exp[,2]>1.3,1]
+p2 <- ggplot(gaba.all.exp, aes(x = slc17a6, y = gad1.1)) +
+  geom_point()
+# Plot the scatter plot with marginal histograms
+ggMarginal(p2, type = "histogram")
+
+gad1.1 <- gad1.1.exp[gad1.1.exp[,2]>1,1]
+gad1.2 <- gad1.2.exp[gad1.2.exp[,2]>1,1]
+
+p3 <- ggplot(gaba.all.exp, aes(x = slc17a6, y = gad2)) +
+  geom_point()
+# Plot the scatter plot with marginal histograms
+ggMarginal(p3, type = "histogram")
+gad2 <- gad2.exp[gad2.exp[,2]>2.5,1]
+
+
+aldh1a1 <- aldh1a1.exp[aldh1a1.exp[,2]>0.5,1]
+
+gaba <- intersect(union(slc18a2, slc32a1), union(gad1.2, union(gad1.1,union(gad2, aldh1a1))))
+gaba[order(gaba)]
+XT.nt$Gaba[XT.nt$subclass %in% gaba]<-1
+
+#Glutamatergic
+plot.glut.xt<-DotPlot(scdata.XT,c("slc17a6","slc17a7","slc17a8", "slc32a1"),cols = c("lightgrey","darkred"))+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1, size = 5), axis.text.y = element_text(size = 5))
+#DotPlot(scdata.XT,c("slc17a8"),cols = c("lightgrey","darkred"), assay = "RNA")+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+slc17a6.exp <- NT.marker.threshold("slc17a6", scdata.XT, "eq_subclass")
+slc17a7.exp <- NT.marker.threshold("slc17a7", scdata.XT, "eq_subclass")
+slc17a8.exp <- NT.marker.threshold("slc17a8", scdata.XT, "eq_subclass")
+
+glut.all.exp<-data.frame(celltype=slc32a1.exp$celltype, slc32a1=slc32a1.exp$mean_lnCPM, slc17a6=slc17a6.exp$mean_lnCPM, slc17a7=slc17a7.exp$mean_lnCPM, slc17a8=slc17a8.exp$mean_lnCPM)
+p2 <- ggplot(glut.all.exp, aes(x = slc17a7, y = slc32a1)) +
+  geom_point()
+# Plot the scatter plot with marginal histograms
+ggMarginal(p2, type = "histogram")
+
+slc17a6 <- slc17a6.exp[slc17a6.exp[,2]>2,1]
+slc17a7 <- slc17a7.exp[slc17a7.exp[,2]>2,1]
+slc17a8 <- slc17a8.exp[slc17a8.exp[,2]>2,1]
+glut <- union(slc17a6, union(slc17a7, slc17a8))
+glut[order(glut)]
+XT.nt$Glut[XT.nt$subclass %in% glut]<-1
+
+
+
+#Serotoninergic
+#Serotonergic (Sero): (Slc6a4 (Sert) or Slc18a2) and (Tph2 and Ddc).
+#Tph1: ENSXETG00000048806
+#Ddc not detected.
+plot.sero.xt<-DotPlot(scdata.XT,c("slc6a4","SLC18A2","tph2","ENSXETG00000048806"),cols = c("lightgrey","darkred"))+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1, size = 5), axis.text.y = element_text(size = 5))
+tph2.exp <- NT.marker.threshold("tph2", scdata.XT, "eq_subclass")
+tph1.exp <- NT.marker.threshold("ENSXETG00000048806", scdata.XT, "eq_subclass")
+slc6a4.exp <- NT.marker.threshold("slc6a4", scdata.XT, "eq_subclass")
+slc6a4 <- slc6a4.exp[slc6a4.exp[,2]>3,1]
+tph2 <- tph2.exp[tph2.exp[,2]>3,1]
+tph1 <- tph1.exp[tph1.exp[,2]>3,1]
+sert <- intersect(union(slc6a4, slc18a2), union(tph2,tph1))
+XT.nt$Sert[XT.nt$subclass %in% sert]<-1
+
+#Glycinergic
+#Glycinergic (Glyc): Slc6a5.
+plot.gly.xt<-DotPlot(scdata.XT,c("slc6a5"),cols = c("lightgrey","darkred"))+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1, size = 5), axis.text.y = element_text(size = 5))
+slc6a5.exp <- NT.marker.threshold("slc6a5", scdata.XT, "eq_subclass")
+gly <- slc6a5.exp[slc6a5.exp[,2]>0.4,1]
+XT.nt$Gly[XT.nt$subclass %in% gly]<-1
+
+#Noradrenergic
+#Noradrenergic (Nora): (Slc6a2 (Net) or Slc18a2) and Dbh.
+plot.nora.xt<-DotPlot(scdata.XT,c("slc6a2","SLC18A2","dbh"),cols = c("lightgrey","darkred"))+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1, size = 5), axis.text.y = element_text(size = 5))
+#DotPlot(scdata.XT,c("slc6a2","dbh"),cols = c("lightgrey","darkred"), assay = "RNA")+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+slc6a2.exp <- NT.marker.threshold("slc6a2", scdata.XT, "eq_subclass")
+dbh.exp <- NT.marker.threshold("dbh", scdata.XT, "eq_subclass")
+nora <- intersect(slc6a2.exp[slc6a2.exp[,2]>1,1], dbh.exp[dbh.exp[,2]>1,1])
+XT.nt$Nora[XT.nt$subclass %in% nora]<-1
+
+
+#Cholinergic
+#Cholinergic (Chol): Slc18a3 (Vacht) and Chat.
+plot.chol.xt<-DotPlot(scdata.XT,c("slc18a3","chat"),cols = c("lightgrey","darkred"))+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1, size = 5), axis.text.y = element_text(size = 5))
+slc18a3.exp <- NT.marker.threshold("slc18a3", scdata.XT, "eq_subclass")
+chat.exp <- NT.marker.threshold("chat", scdata.XT, "eq_subclass")
+chol <- intersect(slc18a3.exp[slc18a3.exp[,2]>1,1], chat.exp[chat.exp[,2]>1,1])
+XT.nt$Chol[XT.nt$subclass %in% chol]<-1
+
+
+#histaminergic
+#Histaminergic (Hist): Slc18a2 and Hdc.
+plot.hist.xt<-DotPlot(scdata.XT,c("SLC18A2","hdc"),cols = c("lightgrey","darkred"))+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1, size = 5), axis.text.y = element_text(size = 5))
+hdc.exp <- NT.marker.threshold("hdc", scdata.XT, "eq_subclass")
+hist <- intersect(slc18a2.exp[slc18a2.exp[,2]>1.5,1], hdc.exp[hdc.exp[,2]>1,1])
+XT.nt$Hist[XT.nt$subclass %in% hist]<-1
+
+NT <- c("Glut","Gaba", "Dopa", "Chol", "Sert", "Nora", "Gly", "Hist")
+NT.1 <- t(replicate(nrow(XT.nt), NT))
+NT.2 <- t(apply(XT.nt[,2:9], 1, as.logical))
+for (i in 1:nrow(XT.nt)) {
+  XT.nt$Neurotransmitter[i] <- paste(NT.1[i,][NT.2[i,]], collapse="-")
+}
+XT.nt$Neurotransmitter[XT.nt$Neurotransmitter==""]<-"unclear"
+#save data
+write.csv(XT.nt, file="./XT.nt.type.csv")
+XT.nt<-read.csv(file="./XT.nt.type.csv")
+
+#add to metadata
+scdata.XT@meta.data$Neurotransmitter <- XT.nt$Neurotransmitter[match(scdata.XT@meta.data$eq_subclass, XT.nt$subclass)]
+color <- colorRampPalette(brewer.pal(9, "Set1")[1:8])(12)
+color <- c(color,"grey")
+
+color=c("#FF3358","#73E785","#fcf04b","#fcf04b","#820e57","#ff7621","#2B93DF","#fcf04b","#0a9964","#820e57","#4F2E91FF","#99999960")
+plot.xt.label<-DimPlot(scdata.XT, group.by = "Neurotransmitter", cols = color, reduction = "tsne")+coord_fixed()
+qs_save(scdata.XT, file = "scdata.XT.qs2", nthreads = 24)
+# Read it back in using 24 CPU cores
+scdata.XT <- qs_read("scdata.XT.qs2", nthreads = 24)
+
+```
+
+
+
+
+## Annotate Coturnix Japonica NT type
+
+
+```{r}
+Idents(scdata.CJ)<-"eq_subclass"
+CJ.nt <- data.frame(scdata.CJ@meta.data[,c("eq_subclass")])
+colnames(CJ.nt)<-"eq_subclass"
+CJ.nt <- CJ.nt[duplicated(CJ.nt$eq_subclass)==F, ]
+CJ.nt <- data.frame(subclass=CJ.nt, Glut=rep(0, length(CJ.nt)), Gaba=rep(0, length(CJ.nt)), Dopa=rep(0, length(CJ.nt)), Chol=rep(0, length(CJ.nt)), Sert=rep(0, length(CJ.nt)), Nora=rep(0, length(CJ.nt)), Gly=rep(0, length(CJ.nt)), Hist=rep(0, length(CJ.nt)), Neurotransmitter=rep(0, length(CJ.nt)))
+
+#find an arbituary threshold for neurotransmitter markers.
+
+#Dopaminergic
+#Dopaminergic (Dopa): (Slc6a3 (Dat) or Slc18a2) and (Th and Ddc).
+#DAT not found in annotation. SLC6A2 has a 95% BLASTP match. The annotated Dopa cell types all have the expression of this gene. However, not all SLC6a2 expression cells are annotated as Dopa because of the lack of Th and Ddc.
+CJ.NT.plot.Dopa <- DotPlot(scdata.CJ,c("SLC6A2","SLC18A2", "DDC","TH"),cols = c("lightgrey","darkred"))+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1, size = 5), axis.text.y = element_text(size = 5))
+slc6a2.exp <- NT.marker.threshold("SLC6A2", scdata.CJ, "eq_subclass")
+ddc.exp <- NT.marker.threshold("DDC", scdata.CJ, "eq_subclass")
+th.exp <- NT.marker.threshold("TH", scdata.CJ, "eq_subclass")
+slc18a2.exp <- NT.marker.threshold("SLC18A2", scdata.CJ, "eq_subclass")
+slc6a2 <- slc6a2.exp[slc6a2.exp[,2]>0.4,1]
+slc18a2 <- slc18a2.exp[slc18a2.exp[,2]>1.5,1]
+th <- th.exp[th.exp[,2]>1,1]
+ddc <- ddc.exp[ddc.exp[,2]>1,1]
+dopa <- intersect(union(slc6a2,slc18a2), intersect(ddc, th))
+#dopa thresold th>3, dat>3
+CJ.nt$Dopa[CJ.nt$subclass %in% dopa]<-1
+
+#Gabaergic
+#GABAergic (GABA): (Slc32a1 (Vgat) or Slc18a2 (Vmat2)) and (Gad1, Gad2 or Aldh1a1).
+CJ.NT.plot.Gaba <- DotPlot(scdata.CJ,c("SLC32A1","SLC18A2","GAD1", "GAD2","SLC17A6","ALDH1A1"),cols = c("lightgrey","darkred"))+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1, size = 5), axis.text.y = element_text(size = 5))
+slc32a1.exp <- NT.marker.threshold("SLC32A1", scdata.CJ, "eq_subclass")
+gad1.exp <- NT.marker.threshold("GAD1", scdata.CJ, "eq_subclass")
+gad2.exp <- NT.marker.threshold("GAD2", scdata.CJ, "eq_subclass")
+aldh1a1.exp <- NT.marker.threshold("ALDH1A1", scdata.CJ, "eq_subclass")
+slc17a6.exp <- NT.marker.threshold("SLC17A6", scdata.CJ, "eq_subclass")
+slc17a7.exp <- NT.marker.threshold("ENSCJPG00005000657", scdata.CJ, "eq_subclass")
+slc17a8.exp <- NT.marker.threshold("SLC17A8", scdata.CJ, "eq_subclass")
+
+
+
+gaba.all.exp<-data.frame(celltype=slc32a1.exp$celltype, slc32a1=slc32a1.exp$mean_lnCPM, gad1=gad1.exp$mean_lnCPM, gad2=gad2.exp$mean_lnCPM, slc17a6=slc17a6.exp$mean_lnCPM, slc17a7=slc17a7.exp$mean_lnCPM, slc17a8=slc17a8.exp$mean_lnCPM)
+# Save the scatter plot in a variable
+p1 <- ggplot(gaba.all.exp, aes(x = slc17a6, y = slc32a1)) +
+  geom_point()
+p1 <- ggplot(gaba.all.exp, aes(x = slc17a7, y = slc32a1)) +
+  geom_point()
+p1 <- ggplot(gaba.all.exp, aes(x = slc17a8, y = slc32a1)) +
+  geom_point()
+# Plot the scatter plot with marginal histograms
+ggMarginal(p1, type = "histogram")
+
+slc32a1 <- slc32a1.exp[slc32a1.exp[,2]>0.5,1]
+p2 <- ggplot(gaba.all.exp, aes(x = slc17a6, y = gad1)) +
+  geom_point()
+# Plot the scatter plot with marginal histograms
+ggMarginal(p2, type = "histogram")
+
+gad1 <- gad1.exp[gad1.exp[,2]>1.5,1]
+
+
+p3 <- ggplot(gaba.all.exp, aes(x = slc17a6, y = gad2)) +
+  geom_point()
+# Plot the scatter plot with marginal histograms
+ggMarginal(p3, type = "histogram")
+gad2 <- gad2.exp[gad2.exp[,2]>3,1]
+aldh1a1 <- aldh1a1.exp[aldh1a1.exp[,2]>1,1]
+
+gaba <- intersect(union(slc18a2, slc32a1), union(gad2, union(gad1,union(gad2, aldh1a1))))
+gaba[order(gaba)]
+CJ.nt$Gaba[CJ.nt$subclass %in% gaba]<-1
+
+#Glutamatergic
+#Glutamatergic (Glut): Slc17a6 (also known as Vglut2), Slc17a7 (Vglut1) or Slc17a8 (Vglut3).
+
+
+slc17a6 <- slc17a6.exp[slc17a6.exp[,2]>2,1]
+slc17a7 <- slc17a7.exp[slc17a7.exp[,2]>1,1]
+slc17a8 <- slc17a8.exp[slc17a8.exp[,2]>1,1]
+glut <- union(slc17a7, union(slc17a6, slc17a8))
+CJ.nt$Glut[CJ.nt$subclass %in% glut]<-1
+
+
+#Serotoninergic
+#Serotonergic (Sero): (Slc6a4 (Sert) or Slc18a2) and (Tph2 or Tph1) and Ddc).
+CJ.NT.plot.Sert <- DotPlot(scdata.CJ,c("SLC6A4","SLC18A2","TPH2", "TPH1", "DDC"),cols = c("lightgrey","darkred"), scale.max = 20)+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1, size = 5), axis.text.y = element_text(size = 5))
+tph2.exp <- NT.marker.threshold("TPH2", scdata.CJ, "eq_subclass")
+slc6a4.exp <- NT.marker.threshold("SLC6A4", scdata.CJ, "eq_subclass")
+ddc.exp <- NT.marker.threshold("DDC", scdata.CJ, "eq_subclass")
+tph1.exp <- NT.marker.threshold("TPH1", scdata.CJ, "eq_subclass")
+
+sert.all.exp<-data.frame(celltype=tph2.exp$celltype, tph2=tph2.exp$mean_lnCPM, slc6a4=slc6a4.exp$mean_lnCPM, ddc=ddc.exp$mean_lnCPM, tph1=tph1.exp$mean_lnCPM)
+# Save the scatter plot in a variable
+p1 <- ggplot(sert.all.exp, aes(x = tph2, y = slc6a4)) +
+  geom_point()
+p1 <- ggplot(sert.all.exp, aes(x = tph2, y = ddc)) +
+  geom_point()
+p1 <- ggplot(sert.all.exp, aes(x = tph2, y = tph1)) +
+  geom_point()
+# Plot the scatter plot with marginal histograms
+ggMarginal(p1, type = "histogram")
+# there are many serotoninergic neurons that are ddc negative.
+
+
+
+
+slc6a4 <- slc6a4.exp[slc6a4.exp[,2]>0.09,1]
+tph2 <- tph2.exp[tph2.exp[,2]>1,1]
+tph1 <- tph1.exp[tph1.exp[,2]>1,1]
+ddc <- ddc.exp[ddc.exp[,2]>1,1]
+sert <- intersect(slc6a4, intersect(union(tph1,tph2), ddc))
+CJ.nt$Sert[CJ.nt$subclass %in% sert]<-1
+#no serotoninergic neurons in quail hypothalamus
+
+#Glycinergic
+#Glycinergic (Glyc): Slc6a5.
+CJ.NT.plot.Gly <- DotPlot(scdata.CJ,c("SLC6A5"),cols = c("lightgrey","darkred"),scale.max = 20)+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1, size = 5), axis.text.y = element_text(size = 5))
+slc6a5.exp <- NT.marker.threshold("SLC6A5", scdata.CJ, "eq_subclass")
+gly <- slc6a5.exp[slc6a5.exp[,2]>0.1,1]
+CJ.nt$Gly[CJ.nt$subclass %in% gly]<-1
+
+#Noradrenergic
+#Noradrenergic (Nora): (Slc6a2 (Net) or Slc18a2) and Dbh.
+CJ.NT.plot.Nora <- DotPlot(scdata.CJ,c("SLC6A2","DBH"),cols = c("lightgrey","darkred"))+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1, size = 5), axis.text.y = element_text(size = 5))
+slc6a2.exp <- NT.marker.threshold("SLC6A2", scdata.CJ, "eq_subclass")
+dbh.exp <- NT.marker.threshold("DBH", scdata.CJ, "eq_subclass")
+slc6a2 <- slc6a2.exp[slc6a2.exp[,2]>0.4,1]
+dbh <- dbh.exp[dbh.exp[,2]>1,1]
+nora <- intersect(union(slc6a2,slc18a2), dbh)
+CJ.nt$Nora[CJ.nt$subclass %in% nora]<-1
+
+
+#Cholinergic
+#Cholinergic (Chol): Slc18a3 (Vacht) and Chat.
+CJ.NT.plot.Chol <- DotPlot(scdata.CJ,c("SLC18A3","CHAT"),cols = c("lightgrey","darkred"))+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1, size = 5), axis.text.y = element_text(size = 5))
+slc18a3.exp <- NT.marker.threshold("SLC18A3", scdata.CJ, "eq_subclass")
+chat.exp <- NT.marker.threshold("CHAT", scdata.CJ, "eq_subclass")
+slc18a3 <- slc18a3.exp[slc18a3.exp[,2]>1,1]
+chat <- chat.exp[chat.exp[,2]>3,1]
+chol <- intersect(slc18a3, chat)
+CJ.nt$Chol[CJ.nt$subclass %in% chol]<-1
+
+
+#histaminergic
+#Histaminergic (Hist): Slc18a2 and Hdc.
+CJ.NT.plot.Hist <- DotPlot(scdata.CJ,c("SLC18A2","HDC"),cols = c("lightgrey","darkred"))+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1, size = 5), axis.text.y = element_text(size = 5))
+hdc.exp <- NT.marker.threshold("HDC", scdata.CJ, "eq_subclass")
+hdc <- hdc.exp[hdc.exp[,2]>1,1]
+hist <- intersect(slc18a2, hdc)
+CJ.nt$Hist[CJ.nt$subclass %in% hist]<-1
+
+NT <- c("Glut","Gaba", "Dopa", "Chol", "Sert", "Nora", "Gly", "Hist")
+NT.1 <- t(replicate(nrow(CJ.nt), NT))
+NT.2 <- t(apply(CJ.nt[,2:9], 1, as.logical))
+for (i in 1:nrow(CJ.nt)) {
+  CJ.nt$Neurotransmitter[i] <- paste(NT.1[i,][NT.2[i,]], collapse="-")
+}
+CJ.nt$Neurotransmitter[CJ.nt$Neurotransmitter==""]<-"unclear"
+#save data
+write.csv(CJ.nt, file="./CJ.nt.type.csv")
+CJ.nt<-read.csv(file="./CJ.nt.type.csv")
+#add to metadata
+scdata.CJ@meta.data$neurotransmitter <- CJ.nt$Neurotransmitter[match(scdata.CJ@meta.data$eq_subclass, CJ.nt$subclass)]
+color <- colorRampPalette(brewer.pal(9, "Set1")[1:8])(13)
+color <- c("grey",color)
+DimPlot(scdata.CJ, group.by = "neurotransmitter", cols = color, reduction = "tsne")+coord_fixed()
+aggregate(rep(1, nrow(scdata.CJ@meta.data)), by = list(x = scdata.CJ@meta.data$neurotransmitter, y = scdata.CJ@meta.data$eq_subclass), sum)
+
+#future(saveRDS(scdata.CJ, file="scdata.CJ.rds"))
+qs_save(scdata.CJ, file = "scdata.CJ.qs2", nthreads = 8)
+# Read it back in using 4 CPU cores
+scdata.CJ <- qs_read("scdata.CJ.qs2", nthreads = 8)
+View(CJ.nt)
+```
+
+
+
+## Annotate Microtus ochrogaster NT type
+
+```{r}
+Idents(scdata.MO)<-"eq_subclass"
+MO.nt <- data.frame(scdata.MO@meta.data[,c("eq_subclass")])
+colnames(MO.nt)<-"eq_subclass"
+MO.nt <- MO.nt[duplicated(MO.nt$eq_subclass)==F, ]
+MO.nt <- data.frame(subclass=MO.nt, Glut=rep(0, length(MO.nt)), Gaba=rep(0, length(MO.nt)), Dopa=rep(0, length(MO.nt)), Chol=rep(0, length(MO.nt)), Sert=rep(0, length(MO.nt)), Nora=rep(0, length(MO.nt)), Gly=rep(0, length(MO.nt)), Hist=rep(0, length(MO.nt)), Neurotransmitter=rep(0, length(MO.nt)))
+
+#find an arbituary threshold for neurotransmitter markers.slow step
+
+#Dopaminergic
+#Dopaminergic (Dopa): (Slc6a3 (Dat) or Slc18a2) and (Th and Ddc).
+MO.NT.plot.Dopa <- DotPlot(scdata.MO,c("Slc6a3","Slc18a2", "Ddc","TH"),cols = c("lightgrey","darkred"))+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1, size = 5), axis.text.y = element_text(size = 5))
+slc6a3.exp <- NT.marker.threshold("Slc6a3", scdata.MO, "eq_subclass")
+ddc.exp <- NT.marker.threshold("Ddc", scdata.MO, "eq_subclass")
+th.exp <- NT.marker.threshold("TH", scdata.MO, "eq_subclass")
+slc18a2.exp <- NT.marker.threshold("Slc18a2", scdata.MO, "eq_subclass")
+
+dopa.all.exp<-data.frame(celltype=slc6a3.exp$celltype, slc6a3=slc6a3.exp$mean_lnCPM, slc18a2=slc18a2.exp$mean_lnCPM, ddc=ddc.exp$mean_lnCPM, th=th.exp$mean_lnCPM)
+# Save the scatter plot in a variable
+p1 <- ggplot(dopa.all.exp, aes(x = slc18a2, y = th)) +
+  geom_point()
+# Plot the scatter plot with marginal histograms
+ggMarginal(p1, type = "histogram")
+p1 <- ggplot(dopa.all.exp, aes(x = slc6a3, y = th)) +
+  geom_point()
+# Plot the scatter plot with marginal histograms
+ggMarginal(p1, type = "histogram")
+p1 <- ggplot(dopa.all.exp, aes(x = ddc, y = th)) +
+  geom_point()
+# Plot the scatter plot with marginal histograms
+ggMarginal(p1, type = "histogram")
+
+slc6a3 <- slc6a3.exp[slc6a3.exp[,2]>0.2,1]
+slc18a2 <- slc18a2.exp[slc18a2.exp[,2]>3,1]
+th <- th.exp[th.exp[,2]>1,1]
+ddc <- ddc.exp[ddc.exp[,2]>3, 1]
+dopa <- intersect(union(slc6a3,slc18a2), intersect(ddc, th))
+MO.nt$Dopa[MO.nt$subclass %in% dopa]<-1
+
+#Gabaergic
+#GABAergic (GABA): (Slc32a1 (Vgat) or Slc18a2 (Vmat2)) and (Gad1, Gad2 or Aldh1a1).
+MO.NT.plot.Gaba <- DotPlot(scdata.MO,c("Slc32a1","Slc18a2","Gad1", "Gad2","Slc17a6","Aldh1a1"),cols = c("lightgrey","darkred"))+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+slc32a1.exp <- NT.marker.threshold("Slc32a1", scdata.MO, "eq_subclass")
+gad1.exp <- NT.marker.threshold("Gad1", scdata.MO, "eq_subclass")
+gad2.exp <- NT.marker.threshold("Gad2", scdata.MO, "eq_subclass")
+aldh1a1.exp <- NT.marker.threshold("Aldh1a1", scdata.MO, "eq_subclass")
+slc17a6.exp <- NT.marker.threshold("Slc17a6", scdata.MO, "eq_subclass")
+gaba.all.exp <- data.frame(
+  celltype = slc32a1.exp$celltype, 
+  slc32a1  = slc32a1.exp$mean_lnCPM, 
+  gad1     = gad1.exp$mean_lnCPM, 
+  gad2     = gad2.exp$mean_lnCPM, 
+  aldh1a1  = aldh1a1.exp$mean_lnCPM,  
+  slc17a6  = slc17a6.exp$mean_lnCPM
+)
+# Save the scatter plot in a variable
+p1 <- ggplot(gaba.all.exp, aes(x = slc17a6, y = slc32a1)) +
+  geom_point()
+# Plot the scatter plot with marginal histograms
+ggMarginal(p1, type = "histogram")
+
+slc32a1 <- slc32a1.exp[slc32a1.exp[,2]>0.15,1]
+p2 <- ggplot(gaba.all.exp, aes(x = slc17a6, y = gad1)) +
+  geom_point()
+# Plot the scatter plot with marginal histograms
+ggMarginal(p2, type = "histogram")
+
+gad1 <- gad1.exp[gad1.exp[,2]>1.5,1]
+
+p3 <- ggplot(gaba.all.exp, aes(x = slc17a6, y = gad2)) +
+  geom_point()
+# Plot the scatter plot with marginal histograms
+ggMarginal(p3, type = "histogram")
+gad2 <- gad2.exp[gad2.exp[,2]>2,1]
+
+
+aldh1a1 <- aldh1a1.exp[aldh1a1.exp[,2]>1,1]
+
+gaba <- intersect(union(slc18a2, slc32a1), union(gad1,union(gad2, aldh1a1)))
+gaba[order(gaba)]
+MO.nt$Gaba[MO.nt$subclass %in% gaba]<-1
+
+
+#Glutamatergic
+#Glutamatergic (Glut): Slc17a6 (also known as Vglut2), Slc17a7 (Vglut1) or Slc17a8 (Vglut3).
+MO.nt.plot.Glut <- DotPlot(scdata.MO,c("Slc17a6","Slc17a7","Slc17a8", "Slc32a1"), scale.max = 20,cols = c("lightgrey","darkred"))+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1, size = 5), axis.text.y = element_text(size = 5))
+slc17a6.exp <- NT.marker.threshold("Slc17a6", scdata.MO, "eq_subclass")
+slc17a7.exp <- NT.marker.threshold("Slc17a7", scdata.MO, "eq_subclass")
+slc17a8.exp <- NT.marker.threshold("Slc17a8", scdata.MO, "eq_subclass")
+
+gaba.all.exp<-data.frame(celltype=slc32a1.exp$celltype, slc32a1=slc32a1.exp$mean_lnCPM, gad1=gad1.exp$mean_lnCPM, gad2=gad2.exp$mean_lnCPM, slc17a6=slc17a6.exp$mean_lnCPM,slc17a7=slc17a7.exp$mean_lnCPM, slc17a8=slc17a8.exp$mean_lnCPM)
+p1 <- ggplot(gaba.all.exp, aes(x = slc17a8, y = slc32a1)) +
+  geom_point()
+# Plot the scatter plot with marginal histograms
+ggMarginal(p1, type = "histogram")
+
+slc17a6 <- slc17a6.exp[slc17a6.exp[,2]>0.5,1]
+slc17a7 <- slc17a7.exp[slc17a7.exp[,2]>1,1]
+slc17a8 <- slc17a8.exp[slc17a8.exp[,2]>1,1]
+glut <- union(slc17a6, union(slc17a7, slc17a8))
+glut[order(glut)]
+MO.nt$Glut[MO.nt$subclass %in% glut]<-1
+
+
+#Serotoninergic
+#Serotonergic (Sero): (Slc6a4 (Sert) or Slc18a2) and (Tph2 and Ddc).
+MO.NT.plot.Sert <- DotPlot(scdata.MO,c("Slc6a4","Slc18a2","Tph2", "Ddc"),cols = c("lightgrey","darkred"))+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+tph2.exp <- NT.marker.threshold("Tph2", scdata.MO, "eq_subclass")
+slc6a4.exp <- NT.marker.threshold("Slc6a4", scdata.MO, "eq_subclass")
+slc6a4 <- slc6a4.exp[slc6a4.exp[,2]>3,1]
+tph2 <- tph2.exp[tph2.exp[,2]>3,1]
+sert <- intersect(union(slc6a4, slc18a2), intersect(tph2, ddc))
+MO.nt$Sert[MO.nt$subclass %in% sert]<-1
+
+#Glycinergic
+#Glycinergic (Glyc): Slc6a5.
+MO.NT.plot.Gly <- DotPlot(scdata.MO,c("Slc6a5"),cols = c("lightgrey","darkred"), scale.max = 20)+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+slc6a5.exp <- NT.marker.threshold("Slc6a5", scdata.MO, "eq_subclass")
+gly <- slc6a5.exp[slc6a5.exp[,2]>0.5,1]
+MO.nt$Gly[MO.nt$subclass %in% gly]<-1
+
+#Noradrenergic
+#Noradrenergic (Nora): (Slc6a2 (Net) or Slc18a2) and Dbh.Slc6a2 is not expressed.
+MO.NT.plot.Nora <- DotPlot(scdata.MO,c("Slc6a2","Slc18a2","Dbh"),cols = c("lightgrey","darkred"))+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+dbh.exp <- NT.marker.threshold("Dbh", scdata.MO, "eq_subclass")
+dbh <- dbh.exp[dbh.exp[,2]>1,1]
+nora <- intersect(slc18a2, dbh)
+MO.nt$Nora[MO.nt$subclass %in% nora]<-1
+
+
+#Cholinergic
+#Cholinergic (Chol): Slc18a3 (Vacht) and Chat. Slc18a3 is not in the annotation.
+MO.NT.plot.Chol <- DotPlot(scdata.MO,c("Chat"),cols = c("lightgrey","darkred"))+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+chat.exp <- NT.marker.threshold("Chat", scdata.MO, "eq_subclass")
+chat <- chat.exp[chat.exp[,2]>3,1]
+chol <- chat
+MO.nt$Chol[MO.nt$subclass %in% chol]<-1
+
+
+#histaminergic
+#Histaminergic (Hist): Slc18a2 and Hdc.
+MO.NT.plot.Hist <- DotPlot(scdata.MO,c("Slc18a2","Hdc"),cols = c("lightgrey","darkred"))+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+hdc.exp <- NT.marker.threshold("Hdc", scdata.MO, "eq_subclass")
+hdc <- hdc.exp[hdc.exp[,2]>3,1]
+hist <- intersect(slc18a2, hdc)
+MO.nt$Hist[MO.nt$subclass %in% hist]<-1
+
+NT <- c("Glut","Gaba", "Dopa", "Chol", "Sert", "Nora", "Gly", "Hist")
+NT.1 <- t(replicate(nrow(MO.nt), NT))
+NT.2 <- t(apply(MO.nt[,2:9], 1, as.logical))
+for (i in 1:nrow(MO.nt)) {
+  MO.nt$Neurotransmitter[i] <- paste(NT.1[i,][NT.2[i,]], collapse="-")
+}
+
+MO.nt$Neurotransmitter[MO.nt$Neurotransmitter==""]<-"unclear"
+#future(saveRDS(scdata.MO, file="scdata.MO.rds"))
+
+#save data
+write.csv(MO.nt, file="./MO.nt.type.csv")
+MO.nt<-read.csv(file="./MO.nt.type.csv")
+#add to metadata
+scdata.MO@meta.data$neurotransmitter <- MO.nt$Neurotransmitter[match(scdata.MO@meta.data$eq_subclass, MO.nt$subclass)]
+color <- colorRampPalette(brewer.pal(9, "Set1")[1:8])(13)
+color <- c("grey",color)
+DimPlot(scdata.MO, group.by = "neurotransmitter", cols = color, reduction = "tsne")+coord_fixed()
+#future(saveRDS(scdata.MO, file="scdata.MO.rds"))
+qs_save(scdata.MO, file = "scdata.MO.qs2", nthreads = 8)
+# Read it back in using 4 CPU cores
+scdata.MO <- qs_read("scdata.MO.qs2", nthreads = 8)
+View(MO.nt)
+```
+
+
+## Annotate Green anole NT type
+
+```{r}
+Idents(scdata.AC)<-"eq_subclass"
+AC.nt <- data.frame(scdata.AC@meta.data[,c("eq_subclass")])
+colnames(AC.nt)<-"eq_subclass"
+AC.nt <- AC.nt[duplicated(AC.nt$eq_subclass)==F, ]
+AC.nt <- data.frame(subclass=AC.nt, Glut=rep(0, length(AC.nt)), Gaba=rep(0, length(AC.nt)), Dopa=rep(0, length(AC.nt)), Chol=rep(0, length(AC.nt)), Sert=rep(0, length(AC.nt)), Nora=rep(0, length(AC.nt)), Gly=rep(0, length(AC.nt)), Hist=rep(0, length(AC.nt)), Neurotransmitter=rep(0, length(AC.nt)))
+
+#find an arbituary threshold for neurotransmitter markers.
+
+#Dopaminergic
+#Dopaminergic (Dopa): (Slc6a3 (Dat) or Slc18a2) and (Th and Ddc). Dat not in the annotation
+AC.NT.plot.Dopa <- DotPlot(scdata.AC,c("slc18a2", "ddc","th"),cols = c("lightgrey","darkred"))+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1, size = 5), axis.text.y = element_text(size = 5))
+ddc.exp <- NT.marker.threshold("ddc", scdata.AC, "eq_subclass")
+th.exp <- NT.marker.threshold("th", scdata.AC, "eq_subclass")
+slc18a2.exp <- NT.marker.threshold("slc18a2", scdata.AC, "eq_subclass")
+slc18a2 <- slc18a2.exp[slc18a2.exp[,2]>2,1]
+th <- th.exp[th.exp[,2]>3,1]
+ddc <- ddc.exp[ddc.exp[,2]>3,1]
+dopa <- intersect(slc18a2, intersect(ddc, th))
+AC.nt$Dopa[AC.nt$subclass %in% dopa]<-1
+
+#Gabaergic
+#GABAergic (GABA): (Slc32a1 (Vgat) or Slc18a2 (Vmat2)) and (Gad1, Gad2 or Aldh1a1). 
+#Glutamatergic
+#Glutamatergic (Glut): Slc17a6 (also known as Vglut2), Slc17a7 (Vglut1) or Slc17a8 (Vglut3).
+
+
+AC.NT.plot.Gaba <- DotPlot(scdata.AC, c("slc32a1","slc18a2", "gad1","gad2","slc17a6","slc17a7","slc17a8","aldh1a1"),cols = c("lightgrey","darkred"))+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1, size = 5), axis.text.y = element_text(size = 5))
+slc32a1.exp <- NT.marker.threshold("slc32a1", scdata.AC, "eq_subclass")
+gad2.exp <- NT.marker.threshold("gad2", scdata.AC, "eq_subclass")
+gad1.exp <- NT.marker.threshold("gad1", scdata.AC, "eq_subclass")
+aldh1a1.exp <- NT.marker.threshold("aldh1a1", scdata.AC, "eq_subclass")
+slc17a6.exp <- NT.marker.threshold("slc17a6", scdata.AC, "eq_subclass")
+slc17a7.exp <- NT.marker.threshold("slc17a7", scdata.AC, "eq_subclass")
+slc17a8.exp <- NT.marker.threshold("slc17a8", scdata.AC, "eq_subclass")
+
+
+gaba.all.exp<-data.frame(celltype=slc32a1.exp$celltype, slc32a1=slc32a1.exp$mean_lnCPM, gad1=gad1.exp$mean_lnCPM, gad2=gad2.exp$mean_lnCPM, slc17a6=slc17a6.exp$mean_lnCPM,slc17a7=slc17a7.exp$mean_lnCPM, slc17a8=slc17a8.exp$mean_lnCPM)
+
+
+p1 <- ggplot(gaba.all.exp, aes(x = slc32a1, y = slc17a6)) +
+  geom_point()
+# Plot the scatter plot with marginal histograms
+ggMarginal(p1, type = "histogram")
+
+slc32a1 <- slc32a1.exp[slc32a1.exp[,2]>0.3,1]
+gad1 <- gad1.exp[gad1.exp[,2]>1.5,1]
+gad2 <- gad2.exp[gad2.exp[,2]>2,1]
+aldh1a1 <- aldh1a1.exp[aldh1a1.exp[,2]>1,1]
+gaba <- intersect(union(slc18a2, slc32a1), union(gad1,union(gad2, aldh1a1)))
+AC.nt$Gaba[AC.nt$subclass %in% gaba]<-1
+
+slc17a6 <- slc17a6.exp[slc17a6.exp[,2]>1,1]
+slc17a7 <- slc17a7.exp[slc17a7.exp[,2]>0.5,1]
+slc17a8 <- slc17a8.exp[slc17a8.exp[,2]>0.5,1]
+glut <- union(slc17a6, union(slc17a7, slc17a8))
+AC.nt$Glut[AC.nt$subclass %in% glut]<-1
+
+
+#Serotoninergic
+#Serotonergic (Sero): (Slc6a4 (Sert) or Slc18a2) and (Tph2 and Ddc).
+AC.NT.plot.Sert <- DotPlot(scdata.AC,c("slc6a4","slc18a2","tph2", "ddc","tph1"),cols = c("lightgrey","darkred"))+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1, size = 5), axis.text.y = element_text(size = 5))
+tph2.exp <- NT.marker.threshold("tph2", scdata.AC, "eq_subclass")
+tph1.exp <- NT.marker.threshold("tph1", scdata.AC, "eq_subclass")
+slc6a4.exp <- NT.marker.threshold("slc6a4", scdata.AC, "eq_subclass")
+slc6a4 <- slc6a4.exp[slc6a4.exp[,2]>3,1]
+tph2 <- tph2.exp[tph2.exp[,2]>3,1]
+tph1 <- tph1.exp[tph1.exp[,2]>0.3,1]
+sert <- intersect(union(slc6a4, slc18a2), intersect(union(tph2,tph1), ddc))
+AC.nt$Sert[AC.nt$subclass %in% sert]<-1
+
+#Glycinergic
+#Glycinergic (Glyc): Slc6a5.
+AC.NT.plot.Gly <- DotPlot(scdata.AC,c("slc6a5"),cols = c("lightgrey","darkred"),scale.max = 20)+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1, size = 5), axis.text.y = element_text(size = 5))
+slc6a5.exp <- NT.marker.threshold("slc6a5", scdata.AC, "eq_subclass")
+gly <- slc6a5.exp[slc6a5.exp[,2]>0.5,1]
+AC.nt$Gly[AC.nt$subclass %in% gly]<-1
+
+#Noradrenergic
+#Noradrenergic (Nora): (Slc6a2 (Net) or Slc18a2) and Dbh Slc6a2 not in the genome
+AC.NT.plot.Nora <- DotPlot(scdata.AC,c("slc6a2","slc18a2","dbh"),cols = c("lightgrey","darkred"))+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1, size = 5), axis.text.y = element_text(size = 5))
+slc6a2.exp <- NT.marker.threshold("slc6a2", scdata.AC, "eq_subclass")
+dbh.exp <- NT.marker.threshold("dbh", scdata.AC, "eq_subclass")
+dbh <- dbh.exp[dbh.exp[,2]>1,1]
+slc6a2 <- slc6a2.exp[slc6a2.exp[,2]>1,1]
+nora <- intersect(slc18a2, dbh)
+
+#Cholinergic
+#Cholinergic (Chol): Slc18a3 (Vacht) and Chat. Slc18a3 is not in the annotation.
+AC.NT.plot.Chol <- DotPlot(scdata.AC,c("slc18a3","chat"),cols = c("lightgrey","darkred"))+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1, size = 5), axis.text.y = element_text(size = 5))
+chat.exp <- NT.marker.threshold("chat", scdata.AC, "eq_subclass")
+slc18a3.exp <- NT.marker.threshold("slc18a3", scdata.AC, "eq_subclass")
+chat <- chat.exp[chat.exp[,2]>3,1]
+slc18a3 <- slc18a3.exp[slc18a3.exp[,2]>3,1]
+chol <- intersect(chat,slc18a3)
+AC.nt$Chol[AC.nt$subclass %in% chol]<-1
+
+
+#histaminergic
+#Histaminergic (Hist): Slc18a2 and Hdc.
+AC.NT.plot.Hist <- DotPlot(scdata.AC,c("slc18a2","hdc"),cols = c("lightgrey","darkred"))+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1, size = 5), axis.text.y = element_text(size = 5))
+hdc.exp <- NT.marker.threshold("hdc", scdata.AC, "eq_subclass")
+hdc <- hdc.exp[hdc.exp[,2]>0.5,1]
+hist <- intersect(slc18a2, hdc)
+AC.nt$Hist[AC.nt$subclass %in% hist]<-1
+
+NT <- c("Glut","Gaba", "Dopa", "Chol", "Sert", "Nora", "Gly", "Hist")
+NT.1 <- t(replicate(nrow(AC.nt), NT))
+NT.2 <- t(apply(AC.nt[,2:9], 1, as.logical))
+for (i in 1:nrow(AC.nt)) {
+  AC.nt$Neurotransmitter[i] <- paste(NT.1[i,][NT.2[i,]], collapse="-")
+}
+
+AC.nt$Neurotransmitter[AC.nt$Neurotransmitter==""]<-"unclear"
+
+
+#save data
+write.csv(AC.nt, file="./AC.nt.type.csv")
+AC.nt<-read.csv(file="./AC.nt.type.csv")
+#add to metadata
+scdata.AC@meta.data$neurotransmitter <- AC.nt$Neurotransmitter[match(scdata.AC@meta.data$eq_subclass, AC.nt$subclass)]
+color=c("#FF3358","#73E785","#820e57","#2B93DF","#fcf04b","#0a9964","#820e57","#ff7621","#820e57","#4F2E91FF","#99999960")
+DimPlot(scdata.AC, group.by = "neurotransmitter", cols = color, reduction = "tsne")+coord_fixed()
+aggregate(rep(1, nrow(scdata.AC@meta.data)), by = list(x = scdata.AC@meta.data$neurotransmitter, y = scdata.AC@meta.data$eq_subclass), sum)
+#future(saveRDS(scdata.AC, file="scdata.AC.rds"))
+qs_save(scdata.AC, file = "scdata.AC.qs2", nthreads = 8)
+# Read it back in using 4 CPU cores
+scdata.AC <- qs_read("scdata.AC.qs2", nthreads = 8)
+View(AC.nt)
+```
+
+
+## Annotate Zebrafish NT type
+```{r}
+Idents(scdata.DR)<-"eq_subclass"
+DR.nt <- data.frame(scdata.DR@meta.data[,c("eq_subclass")])
+colnames(DR.nt)<-"eq_subclass"
+DR.nt <- DR.nt[duplicated(DR.nt$eq_subclass)==F, ]
+DR.nt <- data.frame(subclass=DR.nt, Glut=rep(0, length(DR.nt)), Gaba=rep(0, length(DR.nt)), Dopa=rep(0, length(DR.nt)), Chol=rep(0, length(DR.nt)), Sert=rep(0, length(DR.nt)), Nora=rep(0, length(DR.nt)), Gly=rep(0, length(DR.nt)), Hist=rep(0, length(DR.nt)), Neurotransmitter=rep(0, length(DR.nt)))
+
+#find an arbituary threshold for neurotransmitter markers.
+
+#Dopaminergic
+#Dopaminergic (Dopa): (Slc6a3 (Dat ENSDARG00000004219.10) or Slc18a2 ENSDARG00000015110.10) and (Th ENSDARG00000030621.8 and Ddc ENSDARG00000016494.9). Dat not in the annotation
+DR.NT.plot.Dopa <- DotPlot(scdata.DR,c("slc6a3","ddc", "th","th-1","slc18a2","slc18a2-1"),cols = c("lightgrey","darkred"), scale.max = 20)+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1, size = 10), axis.text.y = element_text(size = 10))
+slc6a3.exp <- NT.marker.threshold("slc6a3", scdata.DR, "eq_subclass")
+ddc.exp <- NT.marker.threshold("ddc", scdata.DR, "eq_subclass")
+#th.exp <- NT.marker.threshold("th", scdata.DR, "eq_subclass")
+th_1.exp <- NT.marker.threshold("th-1", scdata.DR, "eq_subclass")
+slc18a2.exp <- NT.marker.threshold("slc18a2", scdata.DR, "eq_subclass")
+slc18a2_1.exp <- NT.marker.threshold("slc18a2-1", scdata.DR, "eq_subclass")
+slc6a3 <- slc6a3.exp[slc6a3.exp[,2]>1,1]
+slc18a2 <- slc18a2.exp[slc18a2.exp[,2]>0.1,1]
+slc18a2_1 <- slc18a2_1.exp[slc18a2_1.exp[,2]>1,1]
+#th <- th.exp[th.exp[,2]>1,1]
+th_1 <- th_1.exp[th_1.exp[,2]>1,1]
+ddc <- ddc.exp[ddc.exp[,2]>2,1]
+dopa <- intersect(union(union(slc6a3,slc18a2),slc18a2_1), intersect(ddc, th_1))
+DR.nt$Dopa[DR.nt$subclass %in% dopa]<-1
+
+
+
+
+#Gabaergic
+#GABAergic (GABA): (Slc32a1 (Vgat) or Slc18a2 (Vmat2)) and (Gad1, Gad2 or Aldh1a1). 
+#Glutamatergic
+#Glutamatergic (Glut): Slc17a6 (also known as Vglut2), Slc17a7 (Vglut1) or Slc17a8 (Vglut3).
+
+
+DR.NT.plot.Gaba <- DotPlot(scdata.DR, c("slc32a1","slc18a2", "gad1","gad2","slc17a6","slc17a7","slc17a8","aldh1a1"),cols = c("lightgrey","darkred"))+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1, size = 5), axis.text.y = element_text(size = 5))
+slc32a1.exp <- NT.marker.threshold("slc32a1", scdata.DR, "eq_subclass")
+gad2.exp <- NT.marker.threshold("gad2", scdata.DR, "eq_subclass")
+gad1a.exp <- NT.marker.threshold("gad1a", scdata.DR, "eq_subclass")
+gad1b.exp <- NT.marker.threshold("gad1b", scdata.DR, "eq_subclass")
+#gad3.exp <- NT.marker.threshold("gad3", scdata.DR, "eq_subclass")
+slc17a6a.exp <- NT.marker.threshold("slc17a6a", scdata.DR, "eq_subclass")
+#aldh1a1.exp <- NT.marker.threshold("aldh1a1", scdata.DR, "eq_subclass") Teleost does not have this gene
+slc17a6a.exp <- NT.marker.threshold("slc17a6a", scdata.DR, "eq_subclass")
+slc17a6b.exp <- NT.marker.threshold("slc17a6b", scdata.DR, "eq_subclass")
+#slc17a7a.exp <- NT.marker.threshold("slc17a7a", scdata.DR, "eq_subclass")
+#slc17a7a_1.exp <- NT.marker.threshold("slc17a7a-1", scdata.DR, "eq_subclass")
+slc17a7b.exp <- NT.marker.threshold("slc17a7b", scdata.DR, "eq_subclass")
+slc17a8.exp <- NT.marker.threshold("slc17a8", scdata.DR, "eq_subclass")
+#slc17a8_1.exp <- NT.marker.threshold("slc17a8-1", scdata.DR, "eq_subclass")
+
+
+gaba.all.exp<-data.frame(celltype=slc32a1.exp$celltype, slc32a1=slc32a1.exp$mean_lnCPM, gad1a=gad1a.exp$mean_lnCPM,  gad1b=gad1b.exp$mean_lnCPM, gad2=gad2.exp$mean_lnCPM, slc17a6a=slc17a6a.exp$mean_lnCPM, slc17a6b=slc17a6b.exp$mean_lnCPM,  slc17a7b=slc17a7b.exp$mean_lnCPM, slc17a8=slc17a8.exp$mean_lnCPM)
+
+
+p1 <- ggplot(gaba.all.exp, aes(x = slc32a1, y = slc17a6a)) +
+  geom_point()
+# Plot the scatter plot with marginal histograms
+ggMarginal(p1, type = "histogram")
+
+
+slc32a1 <- slc32a1.exp[slc32a1.exp[,2]>2,1]
+gad1a <- gad1a.exp[gad1a.exp[,2]>1,1]
+gad2 <- gad2.exp[gad2.exp[,2]>2,1]
+gad1b <- gad1b.exp[gad1b.exp[,2]>1,1]
+#gad3 <- gad3.exp[gad3.exp[,2]>1,1]
+gaba <- intersect(union(slc18a2, slc32a1), union(union(gad1a, gad2),gad1b))
+DR.nt$Gaba[DR.nt$subclass %in% gaba]<-1
+
+
+slc17a6a <- slc17a6a.exp[slc17a6a.exp[,2]>0.1,1]
+slc17a6b <- slc17a6b.exp[slc17a6b.exp[,2]>0.2,1]
+#slc17a7a <- slc17a7a.exp[slc17a7a.exp[,2]>1,1]
+#slc17a7a_1 <- slc17a7a_1.exp[slc17a7a_1.exp[,2]>0.1,1]
+slc17a7b <- slc17a7b.exp[slc17a7b.exp[,2]>0.15,1]
+slc17a8 <- slc17a8.exp[slc17a8.exp[,2]>0.5,1]
+#slc17a8_1 <- slc17a8_1.exp[slc17a8_1.exp[,2]>0.5,1]
+glut <- union(slc17a6b, union(slc17a6a, union(slc17a7b, slc17a8)))
+DR.nt$Glut[DR.nt$subclass %in% glut]<-1
+
+
+
+
+#Serotoninergic
+#Serotonergic (Sero): (Slc6a4 (Sert) a ENSDARG00000061165.6 b ENSDARG00000057017.6 or Slc18a2 ENSDARG00000015110.10) and (Tph2 ENSDARG00000057239.7 and Ddc ENSDARG00000016494.9). tph1b ENSDARG00000036082.5 tph1a ENSDARG00000029432.8 
+# sert b is more correlated with tph2 and ddc. 
+# tph1a is more correlated with ddc
+# the serotoninergic neurons includes tph1 positive cells in fish
+DR.NT.plot.Sert <- DotPlot(scdata.DR,c("slc6a4a","slc6a4b", "slc18a2","slc18a2-1","tph1a","tph1b","tph1a-1","tph1b-1","tph2","tph2-1","ddc"),cols = c("lightgrey","darkred"), scale.max = 20)+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1, size = 10), axis.text.y = element_text(size = 10))
+#slc6a4a.exp <- NT.marker.threshold("slc6a4a", scdata.DR, "eq_subclass")
+slc6a4b.exp <- NT.marker.threshold("slc6a4b", scdata.DR, "eq_subclass")
+tph2.exp <- NT.marker.threshold("tph2", scdata.DR, "eq_subclass")
+tph2_1.exp <- NT.marker.threshold("tph2-1", scdata.DR, "eq_subclass")
+tph1a.exp <- NT.marker.threshold("tph1a", scdata.DR, "eq_subclass")
+tph1a_1.exp <- NT.marker.threshold("tph1a-1", scdata.DR, "eq_subclass")
+tph1b.exp <- NT.marker.threshold("tph1b", scdata.DR, "eq_subclass")
+tph1b_1.exp <- NT.marker.threshold("tph1b-1", scdata.DR, "eq_subclass")
+ddc.exp <- NT.marker.threshold("ddc", scdata.DR, "eq_subclass")
+#slc6a4a <- slc6a4a.exp[slc6a4a.exp[,2]>0.1,1]
+slc6a4b <- slc6a4b.exp[slc6a4b.exp[,2]>1,1]
+tph2 <- tph2.exp[tph2.exp[,2]>1,1]
+tph2_1 <- tph2_1.exp[tph2_1.exp[,2]>1,1]
+tph1a <- tph1a.exp[tph1a.exp[,2]>1,1]
+tph1a_1 <- tph1a_1.exp[tph1a_1.exp[,2]>0.5,1]
+tph1b <- tph1b.exp[tph1b.exp[,2]>1,1]
+tph1b_1 <- tph1b_1.exp[tph1b_1.exp[,2]>1,1]
+sert <- intersect(union(slc6a4b, slc18a2), intersect(union(tph2_1, union(tph1b_1,union(tph1a_1,union(tph1b,union(tph1a,tph2))))), ddc))
+DR.nt$Sert[DR.nt$subclass %in% sert]<-1
+
+#Glycinergic
+#Glycinergic (Glyc): Slc6a5 ENSDARG00000067964 , not found in data. but the glia glycine transporter is found:ENSDARG00000018534.13
+DR.NT.plot.Gly <- DotPlot(scdata.DR,c("slc6a5"),cols = c("lightgrey","darkred"),scale.max = 20)+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1, size = 5), axis.text.y = element_text(size = 5))
+
+#don't exist
+
+#Noradrenergic
+#Noradrenergic (Nora): (Slc6a2 (Net) ENSDARG00000016141.13 or Slc18a2 ENSDARG00000015110.10) and Dbh ENSDARG00000069446.6
+DR.NT.plot.Nora <- DotPlot(scdata.DR,c("slc6a2","slc18a2","slc18a2-1","dbh","dbh-1"),cols = c("lightgrey","darkred"),scale.max = 20)+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1, size = 5), axis.text.y = element_text(size = 5))
+slc6a2.exp <- NT.marker.threshold("slc6a2", scdata.DR, "eq_subclass")
+dbh.exp <- NT.marker.threshold("dbh", scdata.DR, "eq_subclass")
+#dbh_1.exp <- NT.marker.threshold("dbh-1", scdata.DR, "eq_subclass")
+slc6a2 <- slc6a2.exp[slc6a2.exp[,2]>3,1]
+dbh <- dbh.exp[dbh.exp[,2]>1,1]
+#dbh_1 <- dbh_1.exp[dbh_1.exp[,2]>1,1]
+nora <- intersect(slc6a2, dbh)
+DR.nt$Nora[DR.nt$subclass %in% nora]<-1
+#don't exist
+
+#Cholinergic
+#Cholinergic (Chol): Slc18a3 (Vacht) a ENSDARG00000006356.6 b ENSDARG00000107527.2 and Chat ENSDARG00000015854.11. 
+DR.NT.plot.Chol <- DotPlot(scdata.DR,c("slc18a3a", "slc18a3b","chata"),cols = c("lightgrey","darkred"), scale.max = 20)+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1, size = 5), axis.text.y = element_text(size = 5))
+chat.exp <- NT.marker.threshold("chata", scdata.DR, "eq_subclass")
+slc18a3a.exp <- NT.marker.threshold("slc18a3a", scdata.DR, "eq_subclass")
+slc18a3b.exp <- NT.marker.threshold("slc18a3b", scdata.DR, "eq_subclass")
+chat <- chat.exp[chat.exp[,2]>1,1]
+slc18a3a <- slc18a3a.exp[slc18a3a.exp[,2]>1,1]
+slc18a3b <- slc18a3b.exp[slc18a3b.exp[,2]>1,1]
+chol <- intersect(chat,union(slc18a3a,slc18a3b))
+DR.nt$Chol[DR.nt$subclass %in% chol]<-1
+
+
+#histaminergic
+#Histaminergic (Hist): Slc18a2 ENSDARG00000015110.10 and Hdc ENSDARG00000075454.6 .
+DR.NT.plot.Hist <- DotPlot(scdata.DR,c("slc18a2","slc18a2-1","hdc"),cols = c("lightgrey","darkred"), scale.max = 20, assay = "RNA")+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1, size = 10), axis.text.y = element_text(size = 10))
+hdc.exp <- NT.marker.threshold("hdc", scdata.DR, "eq_subclass")
+hdc <- hdc.exp[hdc.exp[,2]>1,1]
+hist <- intersect(union(slc18a2_1,slc18a2), hdc)
+DR.nt$Hist[DR.nt$subclass %in% hist]<-1
+
+NT <- c("Glut","Gaba", "Dopa", "Chol", "Sert", "Nora", "Gly", "Hist")
+NT.1 <- t(replicate(nrow(DR.nt), NT))
+NT.2 <- t(apply(DR.nt[,2:9], 1, as.logical))
+for (i in 1:nrow(DR.nt)) {
+  DR.nt$Neurotransmitter[i] <- paste(NT.1[i,][NT.2[i,]], collapse="-")
+}
+
+DR.nt$Neurotransmitter[DR.nt$Neurotransmitter==""]<-"unclear"
+
+
+#save data
+write.csv(DR.nt, file="./DR.nt.type.csv")
+DR.nt<-read.csv(file="./DR.nt.type.csv")
+#add to metadata
+scdata.DR@meta.data$neurotransmitter <- DR.nt$Neurotransmitter[match(scdata.DR@meta.data$eq_subclass, DR.nt$subclass)]
+color <- colorRampPalette(brewer.pal(9, "Set1")[1:8])(9)
+color <- c(color,"grey")
+color=c("#FF3358","#fcf04b","#4F2E91FF","#ff7621","#2B93DF","#73E785","#0a9964",
+        "#99999960")
+DimPlot(scdata.DR, group.by = "neurotransmitter", cols = color, reduction = "tsne")+coord_fixed()
+#future(saveRDS(scdata.DR, file="scdata.DR.rds"))
+qs_save(scdata.DR, file = "scdata.DR.qs2", nthreads = 8)
+# Read it back in using 4 CPU cores
+#scdata.DR <- qs_read("scdata.DR.qs2", nthreads = 8)
+View(DR.nt)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+## Examine all possible combination of types between species difference
+```{r}
+
+scdata.MO <- qs_read("scdata.MO.qs2", nthreads = 8)
+scdata.CJ <- qs_read("scdata.CJ.qs2", nthreads = 8)
+scdata.AC <- qs_read("scdata.AC.qs2", nthreads = 8)
+scdata.XT <- qs_read("scdata.XT.qs2", nthreads = 8)
+scdata.DR <- qs_read("scdata.DR.qs2", nthreads = 8)
+
+scdata.AI<-readRDS(file="scdata.AI.HY.rds")
+Idents(scdata.AI)<-"class"
+scdata.AI.HYsubclass <- subset(scdata.AI, idents =  c("11 CNU-HYa GABA","12 HY GABA","13 CNU-HYa Glut","14 HY Glut"))
+unique(scdata.AI.HYsubclass@meta.data$neurotransmitter)
+unique(scdata.MO@meta.data$neurotransmitter)
+unique(scdata.CJ@meta.data$neurotransmitter)
+unique(scdata.AC@meta.data$neurotransmitter)
+unique(scdata.XT@meta.data$Neurotransmitter)
+unique(scdata.DR@meta.data$neurotransmitter)
+
+
+```
+
+
+
+## Table plot of NT changes
+
+```{r}
+metadata.AI.HYsubclass <- scdata.AI.HYsubclass@meta.data
+metadata.AI.HYsubclass <- metadata.AI.HYsubclass[metadata.AI.HYsubclass$neurotransmitter != "",]
+AI.NT <- aggregate(rep(1, nrow(metadata.AI.HYsubclass)), by = list(x = metadata.AI.HYsubclass$neurotransmitter, y = metadata.AI.HYsubclass$subclass), sum)
+# Each subclass can contain more than one neurotransmitter types. use the union for following comparisons.
+# "HY" means cells collected from HY dissection. It includes 192 subclasses. 80 belongs to the 4 major HY classes.
+colnames(AI.NT) <- c("neurotransmitter", "subclass", "#cells")
+AI.NT <- AI.NT[duplicated(AI.NT$subclass)==F,]
+AI.NT[AI.NT$subclass=="058 PAL-STR Gaba-Chol",1]<-"GABA-Chol"
+AI.NT[AI.NT$subclass=="081 ACB-BST-FS D1 Gaba",1]<-"Glut-GABA"
+AI.NT[AI.NT$subclass=="085 SI-MPO-LPO Lhx8 Gaba",1]<-"Glut-GABA"
+AI.NT[AI.NT$subclass=="089 PVR Six3 Sox3 Gaba",1]<-"GABA-Dopa"
+AI.NT[AI.NT$subclass=="092 TMv-PMv Tbx3 Hist-Gaba",1]<-"GABA-Hist"
+AI.NT[AI.NT$subclass=="098 AHN-SBPV-PVHd Pdrm12 Gaba",1]<-"GABA-Dopa"
+AI.NT[AI.NT$subclass=="099 SBPV-PVa Six6 Satb2 Gaba",1]<-"GABA-Dopa"
+AI.NT[AI.NT$subclass=="101 ZI Pax6 Gaba",1]<-"GABA-Dopa"
+AI.NT[AI.NT$subclass=="102 DMH-LHA Gsx1 Gaba",1]<-"GABA-Chol"
+AI.NT[AI.NT$subclass=="106 PVpo-VMPO-MPN Hmx2 Gaba",1]<-"GABA-Dopa"
+AI.NT[AI.NT$subclass=="107 DMH Hmx2 Gaba",1]<-"Glut-GABA-Dopa"
+AI.NT[AI.NT$subclass=="115 MS-SF Bsx Glut",1]<-"Glut-GABA"
+AI.NT[AI.NT$subclass=="119 SI-MA-LPO-LHA Skor1 Glut",1]<-"Glut-GABA"
+AI.NT[AI.NT$subclass=="125 DMH Hmx2 Glut",1]<-"Glut-GABA"
+AI.NT[AI.NT$subclass=="126 ARH-PVp Tbx3 Glut",1]<-"Glut-GABA"
+AI.NT[AI.NT$subclass=="131 LHA-AHN-PVH Otp Trh Glut",1]<-"Glut-GABA"
+AI.NT[AI.NT$subclass=="133 PVH-SO-PVa Otp Glut",1]<-"Glut-GABA"
+AI.NT[AI.NT$subclass=="138 PH Pitx2 Glut",1]<-"Glut-Dopa"
+AI.NT[AI.NT$subclass=="141 PH-SUM Foxa1 Glut",1]<-"Glut-GABA"
+AI.NT[AI.NT$subclass=="145 MH Tac2 Glut",1]<-"Glut-Chol"
+AI.NT[AI.NT$subclass=="159 IF-RL-CLI-PAG Foxa1 Glut",1]<-"Glut-Dopa"
+AI.NT[AI.NT$subclass=="210 PRT Mecom Gaba",1]<-"GABA-Glyc"
+AI.NT[AI.NT$subclass=="213 SCsg Gabrr2 Gaba",1]<-"Glut-GABA"
+AI.NT[AI.NT$subclass=="215 SNc-VTA-RAmb Foxa1 Dopa",1]<-"Glut-GABA-Dopa"
+AI.NT[AI.NT$subclass=="243 PGRN-PARN-MDRN Hoxb5 Glut",1]<-"Glut-GABA"
+AI.NT[AI.NT$subclass=="285 MY Lhx1 Gly-Gaba",1]<-"GABA-Glyc"
+#unify convention
+AI.NT[AI.NT=="GABA"]<-"Gaba"
+AI.NT[AI.NT=="GABA-Chol"]<-"Gaba-Chol"
+AI.NT[AI.NT=="Glut-GABA"]<-"Glut-Gaba"
+AI.NT[AI.NT=="GABA-Dopa"]<-"Gaba-Dopa"
+AI.NT[AI.NT=="GABA-Hist"]<-"Gaba-Hist"
+AI.NT[AI.NT=="Glut-GABA-Dopa"]<-"Glut-Gaba-Dopa"
+AI.NT[AI.NT=="GABA-Glyc"]<-"Gaba-Gly"
+colnames(AI.NT) <- c("MM.NT","subclass","MM_#cells")
+
+#save data
+write.csv(AI.NT, file="./AI.NT.type.csv")
+AI.NT <- read.csv(file="./AI.NT.type.csv")
+
+# extract HY subclasses.
+#scdata.MO<-readRDS(file="scdata.MO.rds")
+#scdata.CJ<-readRDS(file="scdata.CJ.rds")
+#scdata.AC<-readRDS(file="scdata.AC.rds")
+#scdata.XT<-readRDS(file="scdata.XT.rds")
+#scdata.RI<-readRDS(file="scdata.RI.rds")
+#scdata.DR<-readRDS(file="scdata.DR.rds")
+
+MO.nt <- aggregate(rep(1, nrow(scdata.MO@meta.data)), by = list(x = scdata.MO@meta.data$neurotransmitter, 
+                                                                y = scdata.MO@meta.data$eq_subclass), sum)
+colnames(MO.nt) <- c("MO.NT", "subclass", "MO_#cells")
+MO.nt.HY <- MO.nt[MO.nt$subclass %in% AI.NT$subclass,]
+
+CJ.nt <- aggregate(rep(1, nrow(scdata.CJ@meta.data)), by = list(x = scdata.CJ@meta.data$neurotransmitter, 
+                                                                y = scdata.CJ@meta.data$eq_subclass), sum)
+colnames(CJ.nt) <- c("CJ.NT", "subclass", "CJ_#cells")
+CJ.nt.HY <- CJ.nt[CJ.nt$subclass %in% AI.NT$subclass,]
+
+AC.nt <- aggregate(rep(1, nrow(scdata.AC@meta.data)), by = list(x = scdata.AC@meta.data$neurotransmitter, 
+                                                                y = scdata.AC@meta.data$eq_subclass), sum)
+colnames(AC.nt) <- c("AC.NT", "subclass", "AC_#cells")
+AC.nt.HY <- AC.nt[AC.nt$subclass %in% AI.NT$subclass,]
+
+XT.nt <- aggregate(rep(1, nrow(scdata.XT@meta.data)), by = list(x = scdata.XT@meta.data$Neurotransmitter, 
+                                                                y = scdata.XT@meta.data$eq_subclass), sum)
+colnames(XT.nt) <- c("XT.NT", "subclass", "XT_#cells")
+XT.nt.HY <- XT.nt[XT.nt$subclass %in% AI.NT$subclass,]
+
+#RI.nt <- aggregate(rep(1, nrow(scdata.RI@meta.data)), by = list(x = scdata.RI@meta.data$neurotransmitter, 
+#                                                                y = scdata.RI@meta.data$subclass_id_label_reduced_mapping_nounlabeled), sum)
+#colnames(RI.nt) <- c("RI.NT", "subclass", "RI_#cells")
+#RI.nt.HY <- RI.nt[RI.nt$subclass %in% AI.NT$subclass,]
+
+DR.nt <- aggregate(rep(1, nrow(scdata.DR@meta.data)), by = list(x = scdata.DR@meta.data$neurotransmitter, 
+                                                                y = scdata.DR@meta.data$eq_subclass), sum)
+colnames(DR.nt) <- c("DR.NT", "subclass", "DR_#cells")
+DR.nt.HY <- DR.nt[DR.nt$subclass %in% AI.NT$subclass,]
+
+
+NT.all.mapped.HY<-merge(AI.NT, MO.nt.HY, by = "subclass", all = T)
+NT.all.mapped.HY<-merge(NT.all.mapped.HY, CJ.nt.HY, by = "subclass", all = T)
+NT.all.mapped.HY<-merge(NT.all.mapped.HY, AC.nt.HY, by = "subclass", all = T)
+NT.all.mapped.HY<-merge(NT.all.mapped.HY, XT.nt.HY, by = "subclass", all = T)
+NT.all.mapped.HY<-merge(NT.all.mapped.HY, DR.nt.HY, by = "subclass", all = T)
+
+saveRDS(NT.all.mapped.HY, file="./NT.all.mapped.HT.rds")
+NT.all.mapped.HY<-readRDS(file="./NT.all.mapped.HT.rds")
+
+NT.switch.df <- NT.all.mapped.HY[,c("MM.NT","MO.NT","CJ.NT","AC.NT","XT.NT","DR.NT")]
+colnames(NT.switch.df)<-c("Mousue","Prairie vole","Japanese quail", "Green anole","Tropical clawed frog", "zebrafish")
+unique(unlist(NT.switch.df))
+
+# numeric nt labels
+# 1: Glut
+# 2: Gaba
+# 3,4,5,6: Dopa, including Dopa, Gaba-Dopa, GLut-Dopa, Glut-Gaba-Dopa
+# 7,8,9, 10: Chol, including Chol, Gaba-Chol, GLut-Chol, Glut-Gaba-Chol,
+# 11: Nora
+# 12, 13, 14 : Gly
+# 15: Hist
+# 16: Glut-Gaba
+# 0: unclear
+
+NT.switch.df[NT.switch.df=="Glut"]<-1
+NT.switch.df[NT.switch.df=="Gaba"]<-2
+NT.switch.df[NT.switch.df=="Dopa"]<-3
+NT.switch.df[NT.switch.df=="Gaba-Dopa"]<-3
+NT.switch.df[NT.switch.df=="Glut-Dopa"]<-3
+NT.switch.df[NT.switch.df=="Glut-Gaba-Dopa"]<-3
+NT.switch.df[NT.switch.df=="Gaba-Chol"]<-4
+NT.switch.df[NT.switch.df=="Nora"]<-5
+NT.switch.df[NT.switch.df=="Gaba-Gly"]<-6
+NT.switch.df[NT.switch.df=="Gaba-Hist"]<-7
+NT.switch.df[NT.switch.df=="Glut-Gaba-Hist"]<-7
+NT.switch.df[NT.switch.df=="Glut-Gaba-Sert-Hist"]<-7
+NT.switch.df[NT.switch.df=="Glut-Gaba"]<-8
+NT.switch.df[NT.switch.df=="unclear"]<-0
+NT.switch.df[is.na(NT.switch.df)]<-9
+NT.switch.df <- as.matrix(sapply(NT.switch.df, as.numeric))
+rownames(NT.switch.df)<-NT.all.mapped.HY$subclass
+color <- c("#00172D","#2B93DF","#FF3358","#fcf04b","#73E785","#03EDFF","#820e57","#ff7621","#0a9964","#999999")
+switch.plot<-pheatmap(NT.switch.df,
+         cluster_cols = FALSE,
+         cluster_rows = FALSE,
+         color = color,
+         border_color = "black"
+         )+coord_fixed(expand=2)
+sero.color<-"#4f2e91ff"
+
+```
+
+## calculate # of eq.subclass / neurotransmitter type 
+```{r}
+MM.NT.NeqS<-data.frame(table(NT.all.mapped.HY$MM.NT))
+colnames(MM.NT.NeqS)<-c("MM.NT","MM.NT.count")
+sum<-sum(MM.NT.NeqS$MM.NT.count)
+MM.NT.NeqS<-data.frame(
+  NT.type=c("Glut","Gaba","Glut-Gaba","Chol","Dopa","Sero","Nora","Hist", "Gly", "Sero-Dopa", "Sero-Hist"),
+  eq.subclass.count=c(23/sum,26/sum, 10/sum, 1/sum, 9/sum, 0/sum, 0/sum, 1/sum, 0/sum, 0/sum, 0),
+  species=rep("MM",11)
+                        )
+#MO
+MO.nt<-read.csv(file="./MO.nt.type.csv")
+MO.NT.NeqS<-data.frame(table(MO.nt$Neurotransmitter))
+colnames(MO.NT.NeqS)<-c("MO.NT","MO.NT.count")
+sum<-sum(MO.NT.NeqS$MO.NT.count)
+MO.NT.NeqS<-data.frame(
+  NT.type=c("Glut","Gaba","Glut-Gaba","Chol","Dopa","Sero","Nora","Hist","Gly", "Sero-Dopa", "Sero-Hist","unclear"),
+  eq.subclass.count=c(69/sum, 72/sum, 3/sum, 1/sum, 4/sum, 0/sum, 0/sum, 1/sum, 0/sum, 0/sum, 0, 13/sum),
+  species=rep("MO",12)
+)
+  
+# CJ
+CJ.nt<-read.csv(file="./CJ.nt.type.csv")
+CJ.NT.NeqS<-data.frame(table(CJ.nt$Neurotransmitter))
+colnames(CJ.NT.NeqS)<-c("CJ.NT","CJ.NT.count")
+sum<-sum(CJ.NT.NeqS$CJ.NT.count)
+CJ.NT.NeqS<-data.frame(
+  NT.type=c("Glut","Gaba","Glut-Gaba","Chol","Dopa","Sero","Nora","Hist","Gly", "Sero-Dopa", "Sero-Hist","unclear"),
+  eq.subclass.count=c(54/sum, 65/sum, 1/sum, 1/sum, 5/sum, 0, 0, 1/sum, 0, 0, 0, 16/sum),
+  species=rep("CJ",12)
+)
+
+# AC
+AC.nt<-read.csv(file="./AC.nt.type.csv")
+AC.NT.NeqS<-data.frame(table(AC.nt$Neurotransmitter))
+colnames(AC.NT.NeqS)<-c("AC.NT","AC.NT.count")
+sum<-sum(AC.NT.NeqS$AC.NT.count)
+AC.NT.NeqS<-data.frame(
+  NT.type=c("Glut","Gaba","Glut-Gaba","Chol","Dopa","Sero","Nora","Hist","Gly", "Sero-Dopa", "Sero-Hist","unclear"),
+  eq.subclass.count=c(49/sum, 55/sum, 1/sum, 1/sum, 1/sum, 1/sum, 0, 0, 0, 0, 1/sum, 18/sum),
+  species=rep("AC",12)
+)
+
+# XT
+XT.nt<-read.csv(file="./XT.nt.type.csv")
+XT.NT.NeqS<-data.frame(table(XT.nt$Neurotransmitter))
+colnames(XT.NT.NeqS)<-c("XT.NT","XT.NT.count")
+sum<-sum(XT.NT.NeqS$XT.NT.count)
+XT.NT.NeqS<-data.frame(
+  NT.type=c("Glut","Gaba","Glut-Gaba","Chol","Dopa","Sero","Nora","Hist","Gly", "Sero-Dopa", "Sero-Hist","unclear"),
+  eq.subclass.count=c(48/sum, 44/sum, 1/sum, 2/sum, 5/sum, 1/sum, 0, 1/sum, 9/sum, 0, 0, 9/sum),
+  species=rep("XT",12)
+)
+
+# DR
+DR.nt<-read.csv(file="./DR.nt.type.csv")
+DR.NT.NeqS<-data.frame(table(DR.nt$Neurotransmitter))
+colnames(DR.NT.NeqS)<-c("DR.NT","DR.NT.count")
+sum<-sum(DR.NT.NeqS$DR.NT.count)
+DR.NT.NeqS<-data.frame(
+  NT.type=c("Glut","Gaba","Glut-Gaba","Chol","Dopa","Sero","Nora","Hist","Gly", "Sero-Dopa", "Sero-Hist","unclear"),
+  eq.subclass.count=c(21/sum, 31/sum, 2/sum, 1/sum, 2/sum, 0/sum, 0, 1/sum, 0, 2/sum, 0, 25/sum),
+  species=rep("DR",12)
+                        )
+
+all.NT.NeqS <- rbind(MO.NT.NeqS, CJ.NT.NeqS)
+all.NT.NeqS <- rbind(all.NT.NeqS, AC.NT.NeqS)
+all.NT.NeqS <- rbind(all.NT.NeqS, XT.NT.NeqS)
+all.NT.NeqS <- rbind(all.NT.NeqS, DR.NT.NeqS)
+
+all.NT.NeqS <- within(all.NT.NeqS, 
+                       species <- factor(species, levels=c("MO","CJ","AC","XT","DR"))
+)
+
+color=c("#73E785","#fcf04b","#FF3358","#2B93DF","#0a9964","#820e57","#ff7621","#03EDFF","#4f2e91ff", "#4f2e91ff", "#ff7621","#99999960")
+eq.subclass.plot <- ggplot(all.NT.NeqS, aes(fill=NT.type, y=eq.subclass.count, x=species)) + 
+  geom_bar(position="stack", stat="identity")+
+  scale_fill_manual(values = color)+
+  theme_classic()+
+  ylab("%eq.Subclass")
+
+```
+
+## calculate # of cells / neurotransmitter type
+
+```{r}
+#MM
+#extract AI HY subclass cell - NT table
+MM.NT.Ncell <- data.frame(cell.id=rownames(metadata.AI.HYsubclass), NT.type = metadata.AI.HYsubclass$neurotransmitter, subclass=metadata.AI.HYsubclass$subclass)
+
+#relabel
+MM.NT.Ncell$NT.type[MM.NT.Ncell$subclass=="058 PAL-STR Gaba-Chol"] <- "GABA-Chol"
+MM.NT.Ncell$NT.type[MM.NT.Ncell$subclass=="081 ACB-BST-FS D1 Gaba"] <- "Glut-GABA"
+MM.NT.Ncell$NT.type[MM.NT.Ncell$subclass=="085 SI-MPO-LPO Lhx8 Gaba"] <- "Glut-GABA"
+MM.NT.Ncell$NT.type[MM.NT.Ncell$subclass=="089 PVR Six3 Sox3 Gaba"] <- "GABA-Dopa"
+MM.NT.Ncell$NT.type[MM.NT.Ncell$subclass=="092 TMv-PMv Tbx3 Hist-Gaba"] <- "GABA-Hist"
+MM.NT.Ncell$NT.type[MM.NT.Ncell$subclass=="098 AHN-SBPV-PVHd Pdrm12 Gaba"] <- "GABA-Dopa"
+MM.NT.Ncell$NT.type[MM.NT.Ncell$subclass=="099 SBPV-PVa Six6 Satb2 Gaba"] <- "GABA-Dopa"
+MM.NT.Ncell$NT.type[MM.NT.Ncell$subclass=="101 ZI Pax6 Gaba"] <- "GABA-Dopa"
+MM.NT.Ncell$NT.type[MM.NT.Ncell$subclass=="102 DMH-LHA Gsx1 Gaba"] <- "GABA-Chol"
+MM.NT.Ncell$NT.type[MM.NT.Ncell$subclass=="106 PVpo-VMPO-MPN Hmx2 Gaba"] <- "GABA-Dopa"
+MM.NT.Ncell$NT.type[MM.NT.Ncell$subclass=="107 DMH Hmx2 Gaba"] <- "Glut-GABA-Dopa"
+MM.NT.Ncell$NT.type[MM.NT.Ncell$subclass=="115 MS-SF Bsx Glut"] <- "Glut-GABA"
+MM.NT.Ncell$NT.type[MM.NT.Ncell$subclass=="119 SI-MA-LPO-LHA Skor1 Glut"] <- "Glut-GABA"
+MM.NT.Ncell$NT.type[MM.NT.Ncell$subclass=="125 DMH Hmx2 Glut"] <- "Glut-GABA"
+MM.NT.Ncell$NT.type[MM.NT.Ncell$subclass=="126 ARH-PVp Tbx3 Glut"] <- "Glut-GABA"
+MM.NT.Ncell$NT.type[MM.NT.Ncell$subclass=="131 LHA-AHN-PVH Otp Trh Glut"] <- "Glut-GABA"
+MM.NT.Ncell$NT.type[MM.NT.Ncell$subclass=="133 PVH-SO-PVa Otp Glut"] <- "Glut-GABA"
+MM.NT.Ncell$NT.type[MM.NT.Ncell$subclass=="138 PH Pitx2 Glut"] <- "Glut-Dopa"
+MM.NT.Ncell$NT.type[MM.NT.Ncell$subclass=="141 PH-SUM Foxa1 Glut"] <- "Glut-GABA"
+MM.NT.Ncell$NT.type[MM.NT.Ncell$subclass=="145 MH Tac2 Glut"] <- "Glut-Chol"
+MM.NT.Ncell$NT.type[MM.NT.Ncell$subclass=="159 IF-RL-CLI-PAG Foxa1 Glut"] <- "Glut-Dopa"
+MM.NT.Ncell$NT.type[MM.NT.Ncell$subclass=="210 PRT Mecom Gaba"] <- "GABA-Glyc"
+MM.NT.Ncell$NT.type[MM.NT.Ncell$subclass=="213 SCsg Gabrr2 Gaba"] <- "Glut-GABA"
+MM.NT.Ncell$NT.type[MM.NT.Ncell$subclass=="215 SNc-VTA-RAmb Foxa1 Dopa"] <- "Glut-GABA-Dopa"
+MM.NT.Ncell$NT.type[MM.NT.Ncell$subclass=="243 PGRN-PARN-MDRN Hoxb5 Glut"] <- "Glut-GABA"
+MM.NT.Ncell$NT.type[MM.NT.Ncell$subclass=="285 MY Lhx1 Gly-Gaba"] <- "GABA-Glyc"
+#unify convention
+MM.NT.Ncell$NT.type[MM.NT.Ncell$NT.type=="GABA"]<-"Gaba"
+MM.NT.Ncell$NT.type[MM.NT.Ncell$NT.type=="GABA-Chol"]<-"Gaba-Chol"
+MM.NT.Ncell$NT.type[MM.NT.Ncell$NT.type=="Glut-GABA"]<-"Glut-Gaba"
+MM.NT.Ncell$NT.type[MM.NT.Ncell$NT.type=="GABA-Dopa"]<-"Gaba-Dopa"
+MM.NT.Ncell$NT.type[MM.NT.Ncell$NT.type=="GABA-Hist"]<-"Gaba-Hist"
+MM.NT.Ncell$NT.type[MM.NT.Ncell$NT.type=="Glut-GABA-Dopa"]<-"Glut-Gaba-Dopa"
+MM.NT.Ncell$NT.type[MM.NT.Ncell$NT.type=="GABA-Glyc"]<-"Gaba-Gly"
+
+table.MM <- table(MM.NT.Ncell$NT.type)
+sum<-sum(table.MM)
+table.MM <- table.MM/sum
+MM.NT.Ncell<-data.frame(
+  NT.type=c("Glut","Gaba","Glut-Gaba","Chol","Dopa","Sero","Nora","Hist","Gly"),
+  cell.count=c(sum(table.MM[c('Glut','Glut-Dopa')]), sum(table.MM[c('Gaba','Gaba-Chol','Gaba-Dopa','Gaba-Hist')]),sum(table.MM[c('Glut-Gaba','Glut-Gaba-Dopa')]), sum(table.MM[c('Gaba-Chol')]), sum(table.MM[c('Gaba-Dopa','Glut-Dopa','Glut-Gaba-Dopa')]), 0, 0, sum(table.MM[c('Gaba-Hist')]), 0),
+  species=rep("MM",9)
+  )
+
+## MO
+table.MO <- table(scdata.MO$neurotransmitter)
+sum<-sum(table.MO)
+table.MO <- table.MO/sum
+MO.NT.Ncell<-data.frame(
+  NT.type=c("Glut","Gaba","Glut-Gaba","Chol","Dopa","Sero","Nora","Hist","Gly", "Sero-Dopa", "Sero-Hist","unclear"),
+  cell.count=c(sum(table.MO[c('Glut')]), sum(table.MO[c('Gaba')]), sum(table.MO[c('Glut-Gaba')], na.rm = TRUE), sum(table.MO[c('Chol','Glut-Chol','Gaba-Chol')], na.rm = TRUE), sum(table.MO[c('Gaba-Dopa','Glut-Dopa','Glut-Gaba-Dopa')], na.rm = TRUE), sum(table.MO[c('Gaba-Sero','Glut-Sero','Sero')], na.rm = TRUE), sum(table.MO[c('Nora')], na.rm = TRUE), sum(table.MO[c('Gaba-Hist','Glut-Hist','Gaba-Glut-Hist','Hist')], na.rm = TRUE), sum(table.MO[c('Gaba-Gly','Glut-Gly','Gaba-Glut-Gly','Gly')], na.rm = TRUE), sum(table.MO[c('Gaba-Dopa-Sert')], na.rm = TRUE), sum(table.MO[c('Glut-Gaba-Sert-Hist')], na.rm = TRUE), sum(table.MO[c('unclear')])),
+  species=rep("MO",12)
+  ) 
+  
+## CJ
+table.CJ <- table(scdata.CJ$neurotransmitter)
+sum<-sum(table.CJ)
+table.CJ <- table.CJ/sum
+CJ.NT.Ncell<-data.frame(
+  NT.type=c("Glut","Gaba","Glut-Gaba","Chol","Dopa","Sero","Nora","Hist","Gly", "Sero-Dopa", "Sero-Hist","unclear"),
+  cell.count=c(sum(table.CJ[c('Glut')]), sum(table.CJ[c('Gaba')]), sum(table.CJ[c('Glut-Gaba')], na.rm = TRUE), sum(table.CJ[c('Chol','Glut-Chol','Gaba-Chol')], na.rm = TRUE), sum(table.CJ[c('Gaba-Dopa','Glut-Dopa','Glut-Gaba-Dopa')], na.rm = TRUE), sum(table.CJ[c('Gaba-Sero','Glut-Sero','Sero')], na.rm = TRUE), sum(table.CJ[c('Nora')], na.rm = TRUE), sum(table.CJ[c('Gaba-Hist','Glut-Hist','Gaba-Glut-Hist','Hist')], na.rm = TRUE), sum(table.CJ[c('Gaba-Gly','Glut-Gly','Gaba-Glut-Gly','Gly')], na.rm = TRUE), sum(table.CJ[c('Gaba-Dopa-Sert')], na.rm = TRUE), sum(table.CJ[c('Glut-Gaba-Sert-Hist')], na.rm = TRUE), sum(table.CJ[c('unclear')])),
+  species=rep("CJ",12)
+  ) 
+
+## AC
+table.AC <- table(scdata.AC$neurotransmitter)
+sum<-sum(table.AC)
+table.AC <- table.AC/sum
+AC.NT.Ncell<-data.frame(
+  NT.type=c("Glut","Gaba","Glut-Gaba","Chol","Dopa","Sero","Nora","Hist","Gly", "Sero-Dopa", "Sero-Hist","unclear"),
+  cell.count=c(sum(table.AC[c('Glut')]), sum(table.AC[c('Gaba')]), sum(table.AC[c('Glut-Gaba')], na.rm = TRUE), sum(table.AC[c('Chol','Glut-Chol','Gaba-Chol')], na.rm = TRUE), sum(table.AC[c('Gaba-Dopa','Glut-Dopa','Glut-Gaba-Dopa')], na.rm = TRUE), sum(table.AC[c('Gaba-Sero','Glut-Sero','Sero')], na.rm = TRUE), sum(table.AC[c('Nora')], na.rm = TRUE), sum(table.AC[c('Gaba-Hist','Glut-Hist','Gaba-Glut-Hist','Hist')], na.rm = TRUE), sum(table.AC[c('Gaba-Gly','Glut-Gly','Gaba-Glut-Gly','Gly')], na.rm = TRUE), sum(table.AC[c('Gaba-Dopa-Sert')], na.rm = TRUE), sum(table.AC[c('Glut-Gaba-Sert-Hist')], na.rm = TRUE), sum(table.AC[c('unclear')])),
+  species=rep("AC",12)
+  ) 
+
+## XT
+table.XT <- table(scdata.XT$Neurotransmitter)
+sum<-sum(table.XT)
+table.XT <- table.XT/sum
+XT.NT.Ncell<-data.frame(
+  NT.type=c("Glut","Gaba","Glut-Gaba","Chol","Dopa","Sero","Nora","Hist","Gly", "Sero-Dopa", "Sero-Hist","unclear"),
+  cell.count=c(sum(table.XT[c('Glut')]), sum(table.XT[c('Gaba')]), sum(table.XT[c('Glut-Gaba')], na.rm = TRUE), sum(table.XT[c('Chol','Glut-Chol','Gaba-Chol')], na.rm = TRUE), sum(table.XT[c('Gaba-Dopa','Glut-Dopa','Glut-Gaba-Dopa')], na.rm = TRUE), sum(table.XT[c('Gaba-Sero','Glut-Sero','Sero')], na.rm = TRUE), sum(table.XT[c('Nora')], na.rm = TRUE), sum(table.XT[c('Gaba-Hist','Glut-Hist','Gaba-Glut-Hist','Hist')], na.rm = TRUE), sum(table.XT[c('Gaba-Gly','Glut-Gly','Gaba-Glut-Gly','Gly')], na.rm = TRUE), sum(table.XT[c('Gaba-Dopa-Sert')], na.rm = TRUE), sum(table.XT[c('Glut-Gaba-Sert-Hist')], na.rm = TRUE), sum(table.XT[c('unclear')])),
+  species=rep("XT",12)
+  ) 
+
+
+## DR
+table.DR <- table(scdata.DR$neurotransmitter)
+sum<-sum(table.DR)
+table.DR <- table.DR/sum
+DR.NT.Ncell<-data.frame(
+  NT.type=c("Glut","Gaba","Glut-Gaba","Chol","Dopa","Sero","Nora","Hist","Gly", "Sero-Dopa", "Sero-Hist","unclear"),
+  cell.count=c(sum(table.DR[c('Glut')]), sum(table.DR[c('Gaba')]), sum(table.DR[c('Glut-Gaba')], na.rm = TRUE), sum(table.DR[c('Chol','Glut-Chol','Gaba-Chol')], na.rm = TRUE), sum(table.DR[c('Gaba-Dopa','Glut-Dopa','Glut-Gaba-Dopa')], na.rm = TRUE), sum(table.DR[c('Gaba-Sero','Glut-Sero','Sero')], na.rm = TRUE), sum(table.DR[c('Nora')], na.rm = TRUE), sum(table.DR[c('Gaba-Hist','Glut-Hist','Gaba-Glut-Hist','Hist')], na.rm = TRUE), sum(table.DR[c('Gaba-Gly','Glut-Gly','Gaba-Glut-Gly','Gly')], na.rm = TRUE), sum(table.DR[c('Gaba-Dopa-Sert')], na.rm = TRUE), sum(table.DR[c('Glut-Gaba-Sert-Hist')], na.rm = TRUE), sum(table.DR[c('unclear')])),
+  species=rep("DR",12)
+  ) 
+
+
+
+all.NT.Ncell <- rbind(MO.NT.Ncell, CJ.NT.Ncell)
+all.NT.Ncell <- rbind(all.NT.Ncell, AC.NT.Ncell)
+all.NT.Ncell <- rbind(all.NT.Ncell, XT.NT.Ncell)
+all.NT.Ncell <- rbind(all.NT.Ncell, DR.NT.Ncell)
+
+all.NT.Ncell <- within(all.NT.Ncell, 
+                       species <- factor(species, levels=c("MO","CJ","AC","XT","DR"))
+                       )
+
+color=c("#73E785","#fcf04b","#FF3358","#2B93DF","#0a9964","#820e57","#ff7621","#03EDFF","#4F2E91FF","#4F2E9160","#ff762160","#99999960")
+Ncell.NT.plot <- ggplot(all.NT.Ncell, aes(fill=NT.type, y=cell.count, x=species)) + 
+  geom_bar(position="stack", stat="identity")+
+  scale_fill_manual(values = color)+
+  theme_classic()+
+  ylab("% Cell/NT type")
+
+
+  
+```
+
+
+
+## Export NT annotation to Anndata
+
+```{r}
+scdata.MO <- readRDS(file="./scdata.MO.rds")
+scdata.MO@meta.data<-scdata.MO@meta.data[,c("nCount_RNA","nFeature_RNA","key","eq_subclass","eq_subclass","neurotransmitter")]
+scdata.MO@assays$RNA$data<-scdata.MO@assays$RNA$counts
+scdata.MO_V3 <- Convert_Assay(seurat_object = scdata.MO, convert_to = "V3", assay = "RNA")
+as.anndata(x = scdata.MO_V3, file_path = "./", file_name = "scdata.MO.20250220.h5ad",assay = "RNA", main_layer = "data", other_layers = c("counts"), transer_dimreduc = TRUE, verbose = TRUE)
+scdata.AC <- readRDS(file="./scdata.AC.rds")
+as.anndata(x = scdata.AC, file_path = "./", file_name = "scdata.AC.20250220.h5ad")
+scdata.CJ <- readRDS(file="./scdata.CJ.rds")
+as.anndata(x = scdata.CJ, file_path = "./", file_name = "scdata.CJ.20250220.h5ad")
+scdata.XT <- readRDS(file="./scdata.XT.rds")
+as.anndata(x = scdata.XT, file_path = "./", file_name = "scdata.XT.20250220.h5ad")
+scdata.DR <- readRDS(file="./scdata.DR.rds")
+as.anndata(x = scdata.DR, file_path = "./", file_name = "scdata.DR.20250220.h5ad")
+```
+
+
+
